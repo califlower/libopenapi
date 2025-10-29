@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sort"
 	"testing"
 
 	"github.com/pb33f/libopenapi/datamodel/low"
@@ -580,6 +581,156 @@ components:
 	runtime.GC()
 }
 
+func TestBundleBytes_DiscriminatorMappingPreservesOnlyMappedOneOfs(t *testing.T) {
+	mainYAML := `openapi: 3.0.0
+info:
+  title: Mixed oneOf
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    Zoo:
+      type: object
+      properties:
+        resident:
+          $ref: './animals.yaml#/components/schemas/Animal'
+`
+
+	animalsYAML := `components:
+  schemas:
+    Animal:
+      type: object
+      properties:
+        pet:
+          oneOf:
+            - $ref: './animals/pet.yaml#/components/schemas/PetInline'
+            - type: object
+              properties:
+                nickname:
+                  type: string
+      discriminator:
+        propertyName: type
+        mapping:
+          cat: './animals/cat.yaml#/components/schemas/AnimalCat'
+          dog: './animals/dog.yaml#/components/schemas/AnimalDog'
+      oneOf:
+        - $ref: './animals/cat.yaml#/components/schemas/AnimalCat'
+        - $ref: './animals/dog.yaml#/components/schemas/AnimalDog'`
+
+	petOneOfWithoutMapping := `components:
+  schemas:
+    PetInline:
+      type: object
+      properties:
+        name:
+          type: string`
+
+	animalCat := `components:
+  schemas:
+    AnimalCat:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+            - cat
+        meow:
+          type: boolean
+      required:
+        - type
+        - meow`
+
+	animalDog := `components:
+  schemas:
+    AnimalDog:
+      type: object
+      properties:
+        type:
+          type: string
+          enum:
+            - dog
+        bark:
+          type: boolean
+      required:
+        - type
+        - bark`
+
+	tmp := t.TempDir()
+	write := func(name, contents string) {
+		full := filepath.Join(tmp, name)
+		require.NoError(t, os.MkdirAll(filepath.Dir(full), 0o755))
+		require.NoError(t, os.WriteFile(full, []byte(contents), 0o644))
+	}
+	write("main.yaml", mainYAML)
+	write("animals.yaml", animalsYAML)
+	write("animals/pet.yaml", petOneOfWithoutMapping)
+	write("animals/cat.yaml", animalCat)
+	write("animals/dog.yaml", animalDog)
+
+	mainBytes, _ := os.ReadFile(filepath.Join(tmp, "main.yaml"))
+	cfg := &datamodel.DocumentConfiguration{
+		BasePath:            tmp,
+		AllowFileReferences: true,
+	}
+
+	out, err := BundleBytes(mainBytes, cfg)
+	require.NoError(t, err)
+
+	var doc map[string]any
+	require.NoError(t, yaml.Unmarshal(out, &doc))
+
+    componentsNode, ok := doc["components"].(map[string]any)
+    require.True(t, ok, "components block should exist")
+    schemasNode, ok := componentsNode["schemas"].(map[string]any)
+    require.True(t, ok, "components.schemas should exist")
+
+    if testing.Verbose() {
+        var keys []string
+        for k := range schemasNode {
+            keys = append(keys, k)
+        }
+        sort.Strings(keys)
+        t.Logf("schema keys: %v", keys)
+    }
+
+    zooValue, ok := schemasNode["Zoo"]
+    require.True(t, ok, "Zoo schema should exist")
+    zoo, ok := zooValue.(map[string]any)
+    require.True(t, ok, "Zoo schema should be an object")
+
+	zooProps := zoo["properties"].(map[string]any)
+	resident := zooProps["resident"].(map[string]any)
+
+	animalValue, ok := schemasNode["Animal"]
+	var animal map[string]any
+	if ok {
+		animal = animalValue.(map[string]any)
+	} else {
+		animal = resident
+	}
+
+	animalOneOf := animal["oneOf"].([]any)
+	firstAnimal := animalOneOf[0].(map[string]any)
+	assert.Equal(t, "./animals/cat.yaml#/components/schemas/AnimalCat", firstAnimal["$ref"])
+	secondAnimal := animalOneOf[1].(map[string]any)
+	assert.Equal(t, "./animals/dog.yaml#/components/schemas/AnimalDog", secondAnimal["$ref"])
+
+	mapping := animal["discriminator"].(map[string]any)["mapping"].(map[string]any)
+	assert.Equal(t, "./animals/cat.yaml#/components/schemas/AnimalCat", mapping["cat"])
+	assert.Equal(t, "./animals/dog.yaml#/components/schemas/AnimalDog", mapping["dog"])
+
+	animalProps := animal["properties"].(map[string]any)
+	pet := animalProps["pet"].(map[string]any)
+	petOneOf := pet["oneOf"].([]any)
+	firstPet := petOneOf[0].(map[string]any)
+	_, hasRef := firstPet["$ref"]
+	assert.False(t, hasRef, "first Animal.pet oneOf entry should be inlined")
+	_, hasProps := firstPet["properties"]
+	assert.True(t, hasProps, "inline schema should expose properties")
+
+	runtime.GC()
+}
+
 // TestBundleBytes_DiscriminatorMappingPartial tests that a oneOf schema with a
 // discriminator mapping that mentions only *some* of the alternatives keeps the
 // $ref for the un-mapped alternative intact (i.e. it is NOT inlined).
@@ -713,9 +864,9 @@ components:
 	runtime.GC()
 }
 
-// TestBundleBytes_OneOfWithoutDiscriminatorMappingPreserved tests that a oneOf schema
-// without a discriminator mapping keeps external references intact
-func TestBundleBytes_OneOfWithoutDiscriminatorMappingPreserved(t *testing.T) {
+// TestBundleBytes_OneOfWithoutDiscriminatorMappingInlined tests that a oneOf schema
+// without a discriminator mapping is inlined
+func TestBundleBytes_OneOfWithoutDiscriminatorMappingInlined(t *testing.T) {
 	mainYAML := `openapi: 3.0.0
 info:
   title: OneOf inline
@@ -753,8 +904,8 @@ components:
 	})
 	require.NoError(t, err)
 
-	// bundled spec must still contain the external URI string
-	assert.Contains(t, string(bundled), "./cat.yaml#/components/schemas/Cat")
+	// bundled spec must NOT contain the external URI string
+	assert.NotContains(t, string(bundled), "./cat.yaml#/components/schemas/Cat")
 
 	var doc map[string]any
 	require.NoError(t, yaml.Unmarshal(bundled, &doc))
@@ -762,15 +913,10 @@ components:
 	oneOf := doc["components"].(map[string]any)["schemas"].(map[string]any)["Pet"].(map[string]any)["oneOf"].([]any)
 
 	first := oneOf[0].(map[string]any)
-	ref, hasRef := first["$ref"]
-	assert.True(t, hasRef, "first oneOf entry should remain a $ref")
-	assert.Equal(t, "./cat.yaml#/components/schemas/Cat", ref)
-
-	second := oneOf[1].(map[string]any)
-	_, hasSecondRef := second["$ref"]
-	assert.False(t, hasSecondRef, "second oneOf entry should remain inline")
-	_, hasProps := second["properties"]
-	assert.True(t, hasProps, "inline schema should expose properties")
+	_, hasRef := first["$ref"]
+	assert.False(t, hasRef, "first oneOf entry should be inlined (no $ref)")
+	_, hasProps := first["properties"]
+	assert.True(t, hasProps, "inlined schema should expose properties")
 
 	_, catExists := doc["components"].(map[string]any)["schemas"].(map[string]any)["Cat"]
 	assert.False(t, catExists, "Cat must not be duplicated in components")

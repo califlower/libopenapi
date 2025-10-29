@@ -322,24 +322,30 @@ func collectDiscriminatorMappingValues(idx *index.SpecIndex, n *yaml.Node, pinne
 		collectDiscriminatorMappingValues(idx, v, pinned)
 	}
 
-	if oneOf != nil {
-		walkUnionRefs(idx, oneOf, pinned)
-	}
-
 	if discriminator != nil {
-		walkDiscriminatorMapping(idx, discriminator, pinned)
-		walkUnionRefs(idx, anyOf, pinned)
+		if walkDiscriminatorMapping(idx, discriminator, pinned) {
+			walkUnionRefs(idx, oneOf, pinned)
+			walkUnionRefs(idx, anyOf, pinned)
+		}
 	}
 }
 
-func walkDiscriminatorMapping(idx *index.SpecIndex, discriminatorNode *yaml.Node, pinned map[string]struct{}) {
+func walkDiscriminatorMapping(idx *index.SpecIndex, discriminatorNode *yaml.Node, pinned map[string]struct{}) bool {
 	if discriminatorNode.Kind != yaml.MappingNode {
-		return
+		return false
 	}
+
+	hasMapping := false
 
 	for i := 0; i < len(discriminatorNode.Content); i += 2 {
 		if discriminatorNode.Content[i].Value == "mapping" {
 			mappingNode := discriminatorNode.Content[i+1]
+
+			if mappingNode.Kind != yaml.MappingNode {
+				continue
+			}
+
+			hasMapping = true
 
 			for j := 0; j < len(mappingNode.Content); j += 2 {
 				refValue := mappingNode.Content[j+1].Value
@@ -351,6 +357,8 @@ func walkDiscriminatorMapping(idx *index.SpecIndex, discriminatorNode *yaml.Node
 			}
 		}
 	}
+
+	return hasMapping
 }
 
 func walkUnionRefs(idx *index.SpecIndex, seq *yaml.Node, pinned map[string]struct{}) {
