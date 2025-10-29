@@ -322,9 +322,12 @@ func collectDiscriminatorMappingValues(idx *index.SpecIndex, n *yaml.Node, pinne
 		collectDiscriminatorMappingValues(idx, v, pinned)
 	}
 
+	if oneOf != nil {
+		walkUnionRefs(idx, oneOf, pinned)
+	}
+
 	if discriminator != nil {
 		walkDiscriminatorMapping(idx, discriminator, pinned)
-		walkUnionRefs(idx, oneOf, pinned)
 		walkUnionRefs(idx, anyOf, pinned)
 	}
 }

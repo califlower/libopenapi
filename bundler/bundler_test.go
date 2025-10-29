@@ -713,9 +713,9 @@ components:
 	runtime.GC()
 }
 
-// TestBundleBytes_OneOfWithoutDiscriminatorMappingInlined tests that a oneOf schema
-// without a discriminator mapping is inlined
-func TestBundleBytes_OneOfWithoutDiscriminatorMappingInlined(t *testing.T) {
+// TestBundleBytes_OneOfWithoutDiscriminatorMappingPreserved tests that a oneOf schema
+// without a discriminator mapping keeps external references intact
+func TestBundleBytes_OneOfWithoutDiscriminatorMappingPreserved(t *testing.T) {
 	mainYAML := `openapi: 3.0.0
 info:
   title: OneOf inline
@@ -753,8 +753,8 @@ components:
 	})
 	require.NoError(t, err)
 
-	// bundled spec must NOT contain the external URI string
-	assert.NotContains(t, string(bundled), "./cat.yaml#/components/schemas/Cat")
+	// bundled spec must still contain the external URI string
+	assert.Contains(t, string(bundled), "./cat.yaml#/components/schemas/Cat")
 
 	var doc map[string]any
 	require.NoError(t, yaml.Unmarshal(bundled, &doc))
@@ -762,10 +762,15 @@ components:
 	oneOf := doc["components"].(map[string]any)["schemas"].(map[string]any)["Pet"].(map[string]any)["oneOf"].([]any)
 
 	first := oneOf[0].(map[string]any)
-	_, hasRef := first["$ref"]
-	assert.False(t, hasRef, "first oneOf entry should be inlined (no $ref)")
-	_, hasProps := first["properties"]
-	assert.True(t, hasProps, "inlined schema should expose properties")
+	ref, hasRef := first["$ref"]
+	assert.True(t, hasRef, "first oneOf entry should remain a $ref")
+	assert.Equal(t, "./cat.yaml#/components/schemas/Cat", ref)
+
+	second := oneOf[1].(map[string]any)
+	_, hasSecondRef := second["$ref"]
+	assert.False(t, hasSecondRef, "second oneOf entry should remain inline")
+	_, hasProps := second["properties"]
+	assert.True(t, hasProps, "inline schema should expose properties")
 
 	_, catExists := doc["components"].(map[string]any)["schemas"].(map[string]any)["Cat"]
 	assert.False(t, catExists, "Cat must not be duplicated in components")
