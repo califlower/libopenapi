@@ -68,6 +68,49 @@ func TestSchemaProxy_Build_CheckRef(t *testing.T) {
 	assert.NotEmpty(t, low.GenerateHashString(&sch))
 }
 
+func TestSchemaProxy_Build_SetsSchemaIdScope(t *testing.T) {
+	yml := `$id: "https://example.com/schemas/base"
+type: string`
+
+	var sch SchemaProxy
+	var idxNode yaml.Node
+	_ = yaml.Unmarshal([]byte(yml), &idxNode)
+
+	cfg := index.CreateClosedAPIIndexConfig()
+	cfg.SpecAbsolutePath = "https://example.com/openapi.yaml"
+	idx := index.NewSpecIndexWithConfig(&idxNode, cfg)
+
+	err := sch.Build(context.Background(), nil, idxNode.Content[0], idx)
+	assert.NoError(t, err)
+
+	scope := index.GetSchemaIdScope(sch.GetContext())
+	if assert.NotNil(t, scope) {
+		assert.Equal(t, "https://example.com/schemas/base", scope.BaseUri)
+	}
+}
+
+func TestApplySchemaIdScope_NilNode(t *testing.T) {
+	ctx := applySchemaIdScope(context.Background(), nil, nil)
+	assert.Nil(t, index.GetSchemaIdScope(ctx))
+}
+
+func TestApplySchemaIdScope_InvalidIdFallsBack(t *testing.T) {
+	yml := `$id: "http://[::1"`
+
+	var node yaml.Node
+	_ = yaml.Unmarshal([]byte(yml), &node)
+
+	scope := index.NewSchemaIdScope("https://example.com/base")
+	ctx := index.WithSchemaIdScope(context.Background(), scope)
+	updated := applySchemaIdScope(ctx, node.Content[0], nil)
+
+	updatedScope := index.GetSchemaIdScope(updated)
+	if assert.NotNil(t, updatedScope) {
+		assert.Equal(t, "http://[::1", updatedScope.BaseUri)
+		assert.Contains(t, updatedScope.Chain, "http://[::1")
+	}
+}
+
 func TestSchemaProxy_Build_HashInline(t *testing.T) {
 	yml := `type: int`
 

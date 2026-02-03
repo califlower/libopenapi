@@ -448,7 +448,7 @@ func TestResolver_DeepJourney(t *testing.T) {
 	}
 	idx := NewSpecIndexWithConfig(nil, CreateClosedAPIIndexConfig())
 	resolver := NewResolver(idx)
-	assert.Nil(t, resolver.extractRelatives(nil, nil, nil, nil, journey, nil, false, 0))
+	assert.Nil(t, resolver.extractRelatives(nil, nil, nil, nil, journey, nil, false, 0, ""))
 }
 
 func TestResolver_DeepDepth(t *testing.T) {
@@ -481,7 +481,7 @@ func TestResolver_DeepDepth(t *testing.T) {
 	ref := &Reference{
 		FullDefinition: "#/components/schemas/A",
 	}
-	found := resolver.extractRelatives(ref, refA, nil, nil, nil, nil, false, 0)
+	found := resolver.extractRelatives(ref, refA, nil, nil, nil, nil, false, 0, "")
 
 	assert.Nil(t, found)
 	assert.Contains(t, buf.String(), "libopenapi resolver: relative depth exceeded 100 levels")
@@ -809,6 +809,95 @@ func TestResolver_SearchReferenceWithContext_SourceIndex(t *testing.T) {
 	assert.Equal(t, otherIdx, foundIdx)
 }
 
+func TestResolver_SearchReferenceWithContext_SchemaIdBaseFromSearchRef(t *testing.T) {
+	cfg := CreateClosedAPIIndexConfig()
+	cfg.ResolveNestedRefsWithDocumentContext = true
+
+	var rootNode yaml.Node
+	_ = yaml.Unmarshal([]byte("openapi: 3.0.0"), &rootNode)
+	idx := NewSpecIndexWithConfig(&rootNode, cfg)
+
+	searchRef := &Reference{
+		FullDefinition: "#/components/schemas/Thing",
+		SchemaIdBase:   "https://example.com/schemas/base",
+		Index:          idx,
+	}
+	idx.SetMappedReferences(map[string]*Reference{
+		searchRef.FullDefinition: {
+			FullDefinition: searchRef.FullDefinition,
+			Node:           utils.CreateStringNode("value"),
+			Index:          idx,
+			RemoteLocation: cfg.SpecAbsolutePath,
+		},
+	})
+
+	resolver := NewResolver(idx)
+	_, _, ctx := resolver.searchReferenceWithContext(nil, searchRef)
+
+	scope := GetSchemaIdScope(ctx)
+	if assert.NotNil(t, scope) {
+		assert.Equal(t, searchRef.SchemaIdBase, scope.BaseUri)
+	}
+}
+
+func TestResolver_SearchReferenceWithContext_SchemaIdBaseFromSourceRef(t *testing.T) {
+	cfg := CreateClosedAPIIndexConfig()
+	cfg.ResolveNestedRefsWithDocumentContext = true
+
+	var rootNode yaml.Node
+	_ = yaml.Unmarshal([]byte("openapi: 3.0.0"), &rootNode)
+	idx := NewSpecIndexWithConfig(&rootNode, cfg)
+
+	searchRef := &Reference{
+		FullDefinition: "#/components/schemas/Thing",
+		Index:          idx,
+	}
+	idx.SetMappedReferences(map[string]*Reference{
+		searchRef.FullDefinition: {
+			FullDefinition: searchRef.FullDefinition,
+			Node:           utils.CreateStringNode("value"),
+			Index:          idx,
+			RemoteLocation: cfg.SpecAbsolutePath,
+		},
+	})
+
+	sourceRef := &Reference{
+		Index:        idx,
+		SchemaIdBase: "https://example.com/schemas/source",
+	}
+
+	resolver := NewResolver(idx)
+	_, _, ctx := resolver.searchReferenceWithContext(sourceRef, searchRef)
+
+	scope := GetSchemaIdScope(ctx)
+	if assert.NotNil(t, scope) {
+		assert.Equal(t, sourceRef.SchemaIdBase, scope.BaseUri)
+	}
+}
+
+func TestResolver_ResolveSchemaIdBase(t *testing.T) {
+	cfg := CreateClosedAPIIndexConfig()
+	cfg.SpecAbsolutePath = "https://example.com/openapi.yaml"
+	var rootNode yaml.Node
+	_ = yaml.Unmarshal([]byte("openapi: 3.0.0"), &rootNode)
+	idx := NewSpecIndexWithConfig(&rootNode, cfg)
+	resolver := NewResolver(idx)
+
+	assert.Equal(t, "base", resolver.resolveSchemaIdBase("base", nil))
+
+	var noIdNode yaml.Node
+	_ = yaml.Unmarshal([]byte("type: string"), &noIdNode)
+	assert.Equal(t, "base", resolver.resolveSchemaIdBase("base", noIdNode.Content[0]))
+
+	var relNode yaml.Node
+	_ = yaml.Unmarshal([]byte(`$id: "schemas/pet.json"`), &relNode)
+	assert.Equal(t, "https://example.com/schemas/pet.json", resolver.resolveSchemaIdBase("", relNode.Content[0]))
+
+	var badNode yaml.Node
+	_ = yaml.Unmarshal([]byte(`$id: "http://[::1"`), &badNode)
+	assert.Equal(t, "http://[::1", resolver.resolveSchemaIdBase("", badNode.Content[0]))
+}
+
 func TestResolver_ExtractRelatives_HttpFullDefinition(t *testing.T) {
 	refNode := utils.CreateRefNode("#/components/schemas/Root")
 	ref := &Reference{
@@ -822,7 +911,7 @@ func TestResolver_ExtractRelatives_HttpFullDefinition(t *testing.T) {
 	resolver := NewResolver(idx)
 	ref.Index = idx
 
-	_ = resolver.extractRelatives(ref, targetNode, nil, map[string]bool{}, []*Reference{}, map[int]bool{}, false, 0)
+	_ = resolver.extractRelatives(ref, targetNode, nil, map[string]bool{}, []*Reference{}, map[int]bool{}, false, 0, "")
 	assert.NotEmpty(t, resolver.GetResolvingErrors())
 }
 
@@ -912,6 +1001,74 @@ func TestResolver_ResolveComponents_k8s(t *testing.T) {
 
 	circ := resolver.Resolve()
 	assert.Len(t, circ, 0)
+}
+
+func TestResolver_Resolve_UsesSchemaIdBaseForNestedRefs(t *testing.T) {
+	spec := `openapi: "3.1.0"
+info:
+  title: Test API
+  version: 1.0.0
+components:
+  schemas:
+    Integer:
+      $id: "https://example.com/schemas/mixins/integer"
+      type: integer
+    NonNegativeInteger:
+      $id: "https://example.com/schemas/examples/non-negative-integer"
+      $defs:
+        nonNegativeInteger:
+          allOf:
+            - $ref: "/schemas/mixins/integer"
+      $ref: "#/$defs/nonNegativeInteger"
+`
+
+	var rootNode yaml.Node
+	err := yaml.Unmarshal([]byte(spec), &rootNode)
+	assert.NoError(t, err)
+
+	idx := NewSpecIndexWithConfig(&rootNode, CreateClosedAPIIndexConfig())
+	assert.NotNil(t, idx)
+
+	resolver := NewResolver(idx)
+	assert.NotNil(t, resolver)
+
+	errs := resolver.Resolve()
+	assert.Len(t, errs, 0)
+}
+
+func TestResolver_Resolve_UsesSchemaIdBaseViaIdRef(t *testing.T) {
+	spec := `openapi: "3.1.0"
+info:
+  title: Test API
+  version: 1.0.0
+components:
+  schemas:
+    NonNegativeInteger:
+      $ref: "https://example.com/schemas/examples/non-negative-integer"
+    NonNegativeInteger2:
+      $id: "https://example.com/schemas/examples/non-negative-integer"
+      $defs:
+        nonNegativeInteger:
+          allOf:
+            - $ref: "/schemas/mixins/integer"
+      $ref: "#/$defs/nonNegativeInteger"
+    Integer:
+      $id: "https://example.com/schemas/mixins/integer"
+      type: integer
+`
+
+	var rootNode yaml.Node
+	err := yaml.Unmarshal([]byte(spec), &rootNode)
+	assert.NoError(t, err)
+
+	idx := NewSpecIndexWithConfig(&rootNode, CreateClosedAPIIndexConfig())
+	assert.NotNil(t, idx)
+
+	resolver := NewResolver(idx)
+	assert.NotNil(t, resolver)
+
+	errs := resolver.Resolve()
+	assert.Len(t, errs, 0)
 }
 
 // Example of how to resolve the Stripe OpenAPI specification, and check for circular reference errors
