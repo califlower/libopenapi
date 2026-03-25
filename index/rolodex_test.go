@@ -1826,6 +1826,66 @@ func TestRolodex_SetSafeCircularRefs(t *testing.T) {
 	assert.NotNil(t, r.GetSafeCircularReferences())
 }
 
+func TestRolodex_DebouncedSafeCircularReferences_CacheHit(t *testing.T) {
+	r := NewRolodex(CreateOpenAPIIndexConfig())
+	r.SetSafeCircularReferences([]*CircularReferenceResult{
+		{LoopIndex: 1, LoopPoint: &Reference{FullDefinition: "ref-a"}},
+		{LoopIndex: 2, LoopPoint: &Reference{FullDefinition: "ref-b"}},
+	})
+	// Mark as already checked so GetSafeCircularReferences skips resolver walk.
+	r.circChecked = true
+
+	first := r.GetSafeCircularReferences()
+	assert.Len(t, first, 2)
+
+	// Second call should return the cached slice.
+	second := r.GetSafeCircularReferences()
+	assert.Equal(t, first, second)
+}
+
+func TestRolodex_DebouncedIgnoredCircularReferences_CacheHit(t *testing.T) {
+	r := NewRolodex(CreateOpenAPIIndexConfig())
+	r.ignoredCircularReferences = []*CircularReferenceResult{
+		{LoopIndex: 1, LoopPoint: &Reference{FullDefinition: "ign-a"}},
+		{LoopIndex: 2, LoopPoint: &Reference{FullDefinition: "ign-b"}},
+	}
+
+	first := r.GetIgnoredCircularReferences()
+	assert.Len(t, first, 2)
+
+	// Second call should return the cached slice.
+	second := r.GetIgnoredCircularReferences()
+	assert.Equal(t, first, second)
+}
+
+func TestRolodex_DebouncedSafeCircularReferences_CacheInvalidation(t *testing.T) {
+	r := NewRolodex(CreateOpenAPIIndexConfig())
+	r.circChecked = true
+	r.SetSafeCircularReferences([]*CircularReferenceResult{
+		{LoopIndex: 1, LoopPoint: &Reference{FullDefinition: "old-ref"}},
+	})
+
+	first := r.GetSafeCircularReferences()
+	assert.Len(t, first, 1)
+	assert.Equal(t, "old-ref", first[0].LoopPoint.FullDefinition)
+
+	// SetSafeCircularReferences should invalidate the cache.
+	r.SetSafeCircularReferences([]*CircularReferenceResult{
+		{LoopIndex: 1, LoopPoint: &Reference{FullDefinition: "new-ref-a"}},
+		{LoopIndex: 2, LoopPoint: &Reference{FullDefinition: "new-ref-b"}},
+	})
+
+	second := r.GetSafeCircularReferences()
+	assert.Len(t, second, 2)
+	// Verify we got the new data, not stale cache.
+	defs := map[string]bool{}
+	for _, ref := range second {
+		defs[ref.LoopPoint.FullDefinition] = true
+	}
+	assert.True(t, defs["new-ref-a"])
+	assert.True(t, defs["new-ref-b"])
+}
+
 func TestRolodex_CheckSetRootIndex(t *testing.T) {
 	var r *Rolodex
 	r = NewRolodex(CreateOpenAPIIndexConfig())
@@ -2499,4 +2559,130 @@ func TestRolodex_SpecAbsolutePath_AllBranches(t *testing.T) {
 		expected := filepath.Join(testDataDir, "openapi.yaml")
 		assert.Equal(t, expected, rolodex.indexConfig.SpecAbsolutePath)
 	})
+
+	// Test case 4: SpecFilePath starting with ".." (parent directory reference)
+	// This tests the branch: else if strings.HasPrefix(normalizedSpecPath, "..")
+	// This is important to prevent path doubling when users specify paths like
+	// "../other-project/spec.yaml"
+	t.Run("SpecFilePath with parent directory reference", func(t *testing.T) {
+		// Create a minimal spec without external references to test path computation only
+		specBytes := []byte(`openapi: "3.1.0"
+info:
+  title: Test API
+  version: "1.0"
+paths: {}
+`)
+		// Set BasePath to a subdirectory so we can use ".." to go up
+		// BasePath is "rolodex_test_data/dir1" (relative from cwd)
+		// SpecFilePath is "../dir2/doc.yaml" which starts with ".."
+		testDir := filepath.Join(cwd, "rolodex_test_data")
+		relativeBase := filepath.Join("rolodex_test_data", "dir1")
+
+		fsCfg := &LocalFSConfig{
+			BaseDirectory: testDir,
+			DirFS:         os.DirFS(testDir),
+		}
+		fileFS, _ := NewLocalFSWithConfig(fsCfg)
+
+		cf := CreateOpenAPIIndexConfig()
+		cf.BasePath = relativeBase
+		// SpecFilePath starts with ".." - this is the key condition being tested
+		// This simulates a user running: vacuum lint ../other-project/spec.yaml
+		cf.SpecFilePath = filepath.Join("..", "dir2", "doc.yaml")
+		cf.IgnorePolymorphicCircularReferences = true
+		cf.IgnoreArrayCircularReferences = true
+		cf.AvoidCircularReferenceCheck = true
+
+		rolodex := NewRolodex(cf)
+		// Need to add a local FS to trigger path computation logic
+		absBase, _ := filepath.Abs(relativeBase)
+		rolodex.AddLocalFS(absBase, fileFS)
+
+		var rootNode yaml.Node
+		_ = yaml.Unmarshal(specBytes, &rootNode)
+		rolodex.SetRootNode(&rootNode)
+
+		err := rolodex.IndexTheRolodex(context.Background())
+		assert.NoError(t, err)
+
+		// SpecAbsolutePath should be correctly resolved without path doubling
+		// It should resolve "../dir2/doc.yaml" from cwd using filepath.Abs(),
+		// not join with basePath which would cause doubling
+		expected, _ := filepath.Abs(cf.SpecFilePath)
+		assert.Equal(t, expected, rolodex.indexConfig.SpecAbsolutePath)
+
+		// Verify the path is absolute
+		assert.True(t, filepath.IsAbs(rolodex.indexConfig.SpecAbsolutePath))
+
+		// Ensure the path doesn't contain the specific doubled segments that the bug would cause
+		// The bug would cause paths like "dir1/dir2/dir2/doc.yaml" when it should be "dir2/doc.yaml"
+		// Note: We only check for doubled segments in the relative portion of the path,
+		// not the entire absolute path (CI runners may have paths like /work/repo/repo/)
+		assert.NotContains(t, rolodex.indexConfig.SpecAbsolutePath, "dir1"+string(os.PathSeparator)+"dir2"+string(os.PathSeparator)+"dir2")
+		assert.NotContains(t, rolodex.indexConfig.SpecAbsolutePath, "dir2"+string(os.PathSeparator)+"dir2")
+
+		// Verify the path ends correctly
+		assert.True(t, strings.HasSuffix(rolodex.indexConfig.SpecAbsolutePath, filepath.Join("dir2", "doc.yaml")))
+	})
+}
+
+func TestRolodex_Release(t *testing.T) {
+	cfg := CreateOpenAPIIndexConfig()
+	rolodex := NewRolodex(cfg)
+	idx := &SpecIndex{config: cfg}
+	rolodex.AddIndex(idx)
+	rolodex.rootNode = &yaml.Node{Value: "root"}
+	rolodex.rootIndex = idx
+	rolodex.caughtErrors = []error{fmt.Errorf("test")}
+	rolodex.safeCircularReferences = []*CircularReferenceResult{{}}
+	rolodex.infiniteCircularReferences = []*CircularReferenceResult{{}}
+	rolodex.ignoredCircularReferences = []*CircularReferenceResult{{}}
+	rolodex.debouncedSafeCircRefs = []*CircularReferenceResult{{}}
+	rolodex.debouncedIgnoredCircRefs = []*CircularReferenceResult{{}}
+	rolodex.globalSchemaIdRegistry = map[string]*SchemaIdEntry{"test": {}}
+
+	rolodex.Release()
+
+	assert.Nil(t, rolodex.indexes)
+	assert.Nil(t, rolodex.indexMap)
+	assert.Nil(t, rolodex.rootIndex)
+	assert.Nil(t, rolodex.rootNode)
+	assert.Nil(t, rolodex.caughtErrors)
+	assert.Nil(t, rolodex.safeCircularReferences)
+	assert.Nil(t, rolodex.infiniteCircularReferences)
+	assert.Nil(t, rolodex.ignoredCircularReferences)
+	assert.Nil(t, rolodex.debouncedSafeCircRefs)
+	assert.Nil(t, rolodex.debouncedIgnoredCircRefs)
+	assert.Nil(t, rolodex.globalSchemaIdRegistry)
+}
+
+func TestRolodex_Release_Nil(t *testing.T) {
+	var r *Rolodex
+	r.Release() // must not panic
+}
+
+func TestRolodex_Release_Idempotent(t *testing.T) {
+	cfg := CreateOpenAPIIndexConfig()
+	rolodex := NewRolodex(cfg)
+	rolodex.rootNode = &yaml.Node{}
+	rolodex.Release()
+	rolodex.Release() // second call must not panic
+	assert.Nil(t, rolodex.rootNode)
+}
+
+func TestRolodex_Release_ConcurrentSafe(t *testing.T) {
+	cfg := CreateOpenAPIIndexConfig()
+	rolodex := NewRolodex(cfg)
+	idx := &SpecIndex{config: cfg}
+	rolodex.AddIndex(idx)
+
+	// Release acquires locks, so calling it concurrently with GetIndexes must not race.
+	done := make(chan struct{})
+	go func() {
+		rolodex.Release()
+		close(done)
+	}()
+	// GetIndexes also acquires indexLock, so this tests lock correctness.
+	_ = rolodex.GetIndexes()
+	<-done
 }

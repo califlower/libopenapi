@@ -4,12 +4,10 @@
 package low
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"fmt"
-	"hash"
+	"hash/maphash"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -41,10 +39,15 @@ var stringBuilderPool = sync.Pool{
 // Uses sync.Map for thread-safe concurrent access.
 var hashCache sync.Map
 
+// ErrExternalRefSkipped is returned by LocateRefNodeWithContext when
+// SkipExternalRefResolution is enabled and the reference is external.
+var ErrExternalRefSkipped = errors.New("external reference resolution skipped")
+
 // ClearHashCache clears the global hash cache. This should be called before
 // starting a new document comparison to ensure clean state.
 func ClearHashCache() {
-	hashCache = sync.Map{}
+	hashCache.Clear()
+	indexCollectionCache.Clear()
 }
 
 // GetStringBuilder retrieves a strings.Builder from the pool, resets it, and returns it.
@@ -84,19 +87,40 @@ func FindItemInOrderedMapWithKey[T any](item string, collection *orderedmap.Map[
 
 // HashExtensions will generate a hash from the low representation of extensions.
 func HashExtensions(ext *orderedmap.Map[KeyReference[string], ValueReference[*yaml.Node]]) []string {
-	f := []string{}
-
-	for e, node := range orderedmap.SortAlpha(ext).FromOldest() {
-		// Use content-only hash (not index.HashNode which includes line/column)
-		f = append(f, fmt.Sprintf("%s-%s", e.Value, hashYamlNodeFast(node.GetValue())))
+	if ext == nil {
+		return nil
 	}
 
+	// Collect key-value entries and sort by key, avoiding a full map copy via SortAlpha.
+	type entry struct {
+		key  string
+		node *yaml.Node
+	}
+	entries := make([]entry, 0, ext.Len())
+	for k, v := range ext.FromOldest() {
+		entries = append(entries, entry{key: k.Value, node: v.GetValue()})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].key < entries[j].key
+	})
+
+	f := make([]string, 0, len(entries))
+	for _, e := range entries {
+		f = append(f, e.key+"-"+hashYamlNodeFast(e.node))
+	}
 	return f
 }
 
+// indexCollectionCache caches the result of generateIndexCollection per SpecIndex.
+var indexCollectionCache sync.Map
+
 // helper function to generate a list of all the things an index should be searched for.
+// Cached per SpecIndex instance to avoid repeated slice+closure allocations.
 func generateIndexCollection(idx *index.SpecIndex) []func() map[string]*index.Reference {
-	return []func() map[string]*index.Reference{
+	if cached, ok := indexCollectionCache.Load(idx); ok {
+		return cached.([]func() map[string]*index.Reference)
+	}
+	collection := []func() map[string]*index.Reference{
 		idx.GetAllComponentSchemas,
 		idx.GetMappedReferences,
 		idx.GetAllExternalDocuments,
@@ -109,6 +133,8 @@ func generateIndexCollection(idx *index.SpecIndex) []func() map[string]*index.Re
 		idx.GetAllResponses,
 		idx.GetAllSecuritySchemes,
 	}
+	indexCollectionCache.Store(idx, collection)
+	return collection
 }
 
 func LocateRefNodeWithContext(ctx context.Context, root *yaml.Node, idx *index.SpecIndex) (*yaml.Node, *index.SpecIndex, error, context.Context) {
@@ -117,6 +143,10 @@ func LocateRefNodeWithContext(ctx context.Context, root *yaml.Node, idx *index.S
 		if rv == "" {
 			return nil, nil, fmt.Errorf("reference at line %d, column %d is empty, it cannot be resolved",
 				root.Line, root.Column), ctx
+		}
+
+		if idx != nil && idx.GetConfig() != nil && idx.GetConfig().SkipExternalRefResolution && utils.IsExternalRef(rv) {
+			return nil, idx, ErrExternalRefSkipped, ctx
 		}
 
 		origRef := rv
@@ -244,7 +274,7 @@ func LocateRefNodeWithContext(ctx context.Context, root *yaml.Node, idx *index.S
 								sp := strings.Split(specPath, "#")
 								// Create a clean (absolute?) path to the file containing the
 								// referenced value.
-								abs, _ = filepath.Abs(utils.CheckPathOverlap(filepath.Dir(sp[0]), explodedRefValue[0], string(os.PathSeparator)))
+								abs = idx.ResolveRelativeFilePath(filepath.Dir(sp[0]), explodedRefValue[0])
 							}
 							rv = fmt.Sprintf("%s#%s", abs, explodedRefValue[1])
 						} else {
@@ -281,7 +311,7 @@ func LocateRefNodeWithContext(ctx context.Context, root *yaml.Node, idx *index.S
 					} else {
 						if specPath != "" {
 
-							abs, _ := filepath.Abs(utils.CheckPathOverlap(filepath.Dir(specPath), rv, string(os.PathSeparator)))
+							abs := idx.ResolveRelativeFilePath(filepath.Dir(specPath), rv)
 							rv = abs
 
 						} else {
@@ -309,7 +339,7 @@ func LocateRefNodeWithContext(ctx context.Context, root *yaml.Node, idx *index.S
 		// cant be found? last resort is to try a path lookup
 		_, friendly := utils.ConvertComponentIdIntoFriendlyPathSearch(rv)
 		if friendly != "" {
-			path, err := jsonpath.NewPath(friendly, jsonpathconfig.WithPropertyNameExtension())
+			path, err := jsonpath.NewPath(friendly, jsonpathconfig.WithPropertyNameExtension(), jsonpathconfig.WithLazyContextTracking())
 			if err == nil {
 				nodes := path.Query(idx.GetRootNode())
 				if len(nodes) > 0 {
@@ -384,6 +414,10 @@ func ExtractObjectRaw[T Buildable[N], N any](ctx context.Context, key, root *yam
 			if err != nil {
 				circError = err
 			}
+		} else if errors.Is(err, ErrExternalRefSkipped) {
+			var n T = new(N)
+			SetReference(n, rv, root)
+			return n, nil, true, rv
 		} else {
 			if err != nil {
 				return nil, fmt.Errorf("object extraction failed: %s", err.Error()), isReference, referenceValue
@@ -434,6 +468,12 @@ func ExtractObject[T Buildable[N], N any](ctx context.Context, label string, roo
 			if err != nil {
 				circError = err
 			}
+		} else if errors.Is(err, ErrExternalRefSkipped) {
+			var n T = new(N)
+			SetReference(n, refVal, root)
+			res := NodeReference[T]{Value: n, KeyNode: rl, ValueNode: root}
+			res.SetReference(refVal, root)
+			return res, nil
 		} else {
 			if err != nil {
 				return NodeReference[T]{}, fmt.Errorf("object extraction failed: %s", err.Error())
@@ -456,6 +496,12 @@ func ExtractObject[T Buildable[N], N any](ctx context.Context, label string, roo
 					if lerr != nil {
 						circError = lerr
 					}
+				} else if errors.Is(lerr, ErrExternalRefSkipped) {
+					var n T = new(N)
+					SetReference(n, rVal, vn)
+					res := NodeReference[T]{Value: n, KeyNode: ln, ValueNode: vn}
+					res.SetReference(rVal, vn)
+					return res, nil
 				} else {
 					if lerr != nil {
 						return NodeReference[T]{}, fmt.Errorf("object extraction failed: %s", lerr.Error())
@@ -501,8 +547,34 @@ func SetReference(obj any, ref string, refNode *yaml.Node) {
 		return
 	}
 
+	// Ensure the embedded *Reference is initialized before calling SetReference.
+	// Buildable types embed *Reference (a pointer) which is nil after new(T).
+	// Calling SetReference on a nil *Reference would panic.
+	initEmbeddedReference(obj)
+
 	if r, ok := obj.(SetReferencer); ok {
 		r.SetReference(ref, refNode)
+	}
+}
+
+// initEmbeddedReference uses reflection to find and initialize a nil *Reference
+// field embedded in obj. This is needed when objects are created via new(T) without
+// calling Build(), which normally initializes the embedded *Reference.
+func initEmbeddedReference(obj any) {
+	v := reflect.ValueOf(obj)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return
+	}
+	v = v.Elem()
+	if v.Kind() != reflect.Struct {
+		return
+	}
+	f := v.FieldByName("Reference")
+	if !f.IsValid() || f.Kind() != reflect.Ptr || !f.IsNil() {
+		return
+	}
+	if f.Type() == reflect.TypeOf((*Reference)(nil)) {
+		f.Set(reflect.ValueOf(new(Reference)))
 	}
 }
 
@@ -526,6 +598,8 @@ func ExtractArray[T Buildable[N], N any](ctx context.Context, label string, root
 			if err != nil {
 				circError = err
 			}
+		} else if errors.Is(err, ErrExternalRefSkipped) {
+			return []ValueReference[T]{}, rl, root, nil
 		} else {
 			return []ValueReference[T]{}, nil, nil, fmt.Errorf("array build failed: reference cannot be found: %s",
 				root.Content[1].Value)
@@ -543,6 +617,8 @@ func ExtractArray[T Buildable[N], N any](ctx context.Context, label string, root
 					if err != nil {
 						circError = err
 					}
+				} else if errors.Is(err, ErrExternalRefSkipped) {
+					return []ValueReference[T]{}, ln, vn, nil
 				} else {
 					if err != nil {
 						return []ValueReference[T]{}, nil, nil,
@@ -590,6 +666,13 @@ func ExtractArray[T Buildable[N], N any](ctx context.Context, label string, root
 					if err != nil {
 						circError = err
 					}
+				} else if errors.Is(err, ErrExternalRefSkipped) {
+					var n T = new(N)
+					SetReference(n, rv, node)
+					v := ValueReference[T]{Value: n, ValueNode: node}
+					v.SetReference(rv, node)
+					items = append(items, v)
+					continue
 				} else {
 					if err != nil {
 						return []ValueReference[T]{}, nil, nil, fmt.Errorf("array build failed: reference cannot be found: %s",
@@ -648,7 +731,7 @@ func ExtractMapNoLookupExtensions[PT Buildable[N], N any](
 		for i := 0; i < rlen; i++ {
 			node := root.Content[i]
 			if !includeExtensions {
-				if strings.HasPrefix(strings.ToLower(node.Value), "x-") {
+				if len(node.Value) >= 2 && (node.Value[0] == 'x' || node.Value[0] == 'X') && node.Value[1] == '-' {
 					skip = true
 					continue
 				}
@@ -691,6 +774,13 @@ func ExtractMapNoLookupExtensions[PT Buildable[N], N any](
 					if err != nil {
 						circError = err
 					}
+				} else if errors.Is(err, ErrExternalRefSkipped) {
+					var n PT = new(N)
+					SetReference(n, rv, node)
+					v := ValueReference[PT]{Value: n, ValueNode: node}
+					v.SetReference(rv, node)
+					valueMap.Set(KeyReference[string]{Value: currentKey.Value, KeyNode: currentKey}, v)
+					continue
 				} else {
 					if err != nil {
 						return nil, fmt.Errorf("map build failed: reference cannot be found: %s", err.Error())
@@ -784,6 +874,8 @@ func ExtractMapExtensions[PT Buildable[N], N any](
 			if err != nil {
 				circError = err
 			}
+		} else if errors.Is(err, ErrExternalRefSkipped) {
+			return nil, rl, root, nil
 		} else {
 			return nil, labelNode, valueNode, fmt.Errorf("map build failed: reference cannot be found: %s",
 				root.Content[1].Value)
@@ -801,6 +893,8 @@ func ExtractMapExtensions[PT Buildable[N], N any](
 					if err != nil {
 						circError = err
 					}
+				} else if errors.Is(err, ErrExternalRefSkipped) {
+					return nil, labelNode, valueNode, nil
 				} else {
 					if err != nil {
 						return nil, labelNode, valueNode, fmt.Errorf("map build failed: reference cannot be found: %s",
@@ -891,6 +985,15 @@ func ExtractMapExtensions[PT Buildable[N], N any](
 					if err != nil {
 						circError = err
 					}
+				} else if errors.Is(err, ErrExternalRefSkipped) {
+					var n PT = new(N)
+					SetReference(n, refVal, en)
+					v := ValueReference[PT]{Value: n, ValueNode: en}
+					v.SetReference(refVal, en)
+					return mappingResult[PT]{
+						k: KeyReference[string]{KeyNode: input.label, Value: input.label.Value},
+						v: v,
+					}, nil
 				} else {
 					if err != nil {
 						return mappingResult[PT]{}, fmt.Errorf("flat map build failed: reference cannot be found: %s",
@@ -1082,9 +1185,7 @@ func GenerateHashString(v any) string {
 			str = fmt.Sprint(v)
 		}
 
-		// Use hex.EncodeToString which is more efficient than fmt.Sprintf
-		hash := sha256.Sum256([]byte(str))
-		hashStr = hex.EncodeToString(hash[:])
+		hashStr = strconv.FormatUint(maphash.String(globalHashSeed, str), 16)
 	}
 
 	// Store in cache if we have a valid pointer and caching is enabled for this type
@@ -1110,13 +1211,13 @@ func hashYamlNodeFast(n *yaml.Node) string {
 		}
 	}
 
-	// Use a hasher instead of marshaling
-	h := sha256.New()
-	visited := make(map[*yaml.Node]bool)
+	h := hasherPool.Get().(*maphash.Hash)
+	h.Reset()
+	visited := getVisitedMap()
 	hashNodeTree(h, n, visited)
-
-	// Use hex.EncodeToString which is more efficient than fmt.Sprintf
-	result := hex.EncodeToString(h.Sum(nil))
+	putVisitedMap(visited)
+	result := strconv.FormatUint(h.Sum64(), 16)
+	hasherPool.Put(h)
 
 	// Cache complex nodes
 	if n.Kind != yaml.ScalarNode {
@@ -1127,7 +1228,7 @@ func hashYamlNodeFast(n *yaml.Node) string {
 }
 
 // hashNodeTree walks the YAML tree and hashes it without marshaling
-func hashNodeTree(h hash.Hash, n *yaml.Node, visited map[*yaml.Node]bool) {
+func hashNodeTree(h *maphash.Hash, n *yaml.Node, visited map[*yaml.Node]bool) {
 	if n == nil {
 		return
 	}
@@ -1178,7 +1279,7 @@ func hashNodeTree(h hash.Hash, n *yaml.Node, visited map[*yaml.Node]bool) {
 		// For maps, we need consistent ordering
 		// Collect key-value pairs and sort by key hash
 		type kvPair struct {
-			keyHash   string
+			keyHash   uint64
 			keyNode   *yaml.Node
 			valueNode *yaml.Node
 		}
@@ -1186,14 +1287,15 @@ func hashNodeTree(h hash.Hash, n *yaml.Node, visited map[*yaml.Node]bool) {
 
 		for i := 0; i < len(content); i += 2 {
 			if i+1 < len(content) {
-				// Hash the key for sorting
-				keyH := sha256.New()
+				keyH := hasherPool.Get().(*maphash.Hash)
+				keyH.Reset()
 				hashNodeTree(keyH, content[i], visited)
 				pairs = append(pairs, kvPair{
-					keyHash:   fmt.Sprintf("%x", keyH.Sum(nil)),
+					keyHash:   keyH.Sum64(),
 					keyNode:   content[i],
 					valueNode: content[i+1],
 				})
+				hasherPool.Put(keyH)
 			}
 		}
 
@@ -1238,21 +1340,24 @@ func CompareYAMLNodes(left, right *yaml.Node) bool {
 		return false
 	}
 
-	// Use the existing hashNodeTree function to generate consistent hashes
-	leftHash := sha256.New()
-	rightHash := sha256.New()
+	leftH := hasherPool.Get().(*maphash.Hash)
+	leftH.Reset()
+	rightH := hasherPool.Get().(*maphash.Hash)
+	rightH.Reset()
 
-	leftVisited := make(map[*yaml.Node]bool)
-	rightVisited := make(map[*yaml.Node]bool)
+	leftVisited := getVisitedMap()
+	rightVisited := getVisitedMap()
 
-	hashNodeTree(leftHash, left, leftVisited)
-	hashNodeTree(rightHash, right, rightVisited)
+	hashNodeTree(leftH, left, leftVisited)
+	hashNodeTree(rightH, right, rightVisited)
 
-	leftSum := leftHash.Sum(nil)
-	rightSum := rightHash.Sum(nil)
+	result := leftH.Sum64() == rightH.Sum64()
 
-	// Compare the hash bytes directly
-	return bytes.Equal(leftSum, rightSum)
+	putVisitedMap(leftVisited)
+	putVisitedMap(rightVisited)
+	hasherPool.Put(leftH)
+	hasherPool.Put(rightH)
+	return result
 }
 
 // YAMLNodeToBytes converts a YAML node to bytes in a more efficient way than yaml.Marshal
@@ -1274,14 +1379,18 @@ func HashYAMLNodeSlice(nodes []*yaml.Node) string {
 		return ""
 	}
 
-	h := sha256.New()
-	visited := make(map[*yaml.Node]bool)
+	h := hasherPool.Get().(*maphash.Hash)
+	h.Reset()
+	visited := getVisitedMap()
 
 	for _, node := range nodes {
 		hashNodeTree(h, node, visited)
 	}
 
-	return fmt.Sprintf("%x", h.Sum(nil))
+	putVisitedMap(visited)
+	result := strconv.FormatUint(h.Sum64(), 16)
+	hasherPool.Put(h)
+	return result
 }
 
 // AppendMapHashes will append all the hashes of a map to a slice of strings.

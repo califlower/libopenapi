@@ -10,6 +10,7 @@ import (
 
 	"github.com/pb33f/libopenapi/utils"
 	"github.com/stretchr/testify/assert"
+	"go.yaml.in/yaml/v4"
 )
 
 const (
@@ -44,6 +45,74 @@ var badYAML = `name: kitty
 // badYAMLDuplicateKey is the exact scenario from issue #355
 // Duplicate mapping keys should trigger a decode error
 var badYAMLDuplicateKey = `openapi: 3.0.1
+info:
+  title: Test API
+  version: 1.0.0
+paths:
+  /pets:
+    get:
+      summary: List all pets
+      responses:
+        '200':
+          description: Success
+    get:
+      summary: Duplicate get operation (invalid!)
+      responses:
+        '200':
+          description: This is a duplicate key`
+
+var badYAMLDuplicateKey2 = `swagger: 2.0
+info:
+  title: Test API
+  version: 1.0.0
+paths:
+  /pets:
+    get:
+      summary: List all pets
+      responses:
+        '200':
+          description: Success
+    get:
+      summary: Duplicate get operation (invalid!)
+      responses:
+        '200':
+          description: This is a duplicate key`
+
+var badYAMLDuplicateKeyAsync = `asyncapi: 3.0
+info:
+  title: Test API
+  version: 1.0.0
+paths:
+  /pets:
+    get:
+      summary: List all pets
+      responses:
+        '200':
+          description: Success
+    get:
+      summary: Duplicate get operation (invalid!)
+      responses:
+        '200':
+          description: This is a duplicate key`
+
+var badYAMLDuplicateKeyUnknown = `chipchop: 3.0
+info:
+  title: Test API
+  version: 1.0.0
+paths:
+  /pets:
+    get:
+      summary: List all pets
+      responses:
+        '200':
+          description: Success
+    get:
+      summary: Duplicate get operation (invalid!)
+      responses:
+        '200':
+          description: This is a duplicate key`
+
+var badYAMLDuplicateUnknownType = `chipchop: 3.0
 info:
   title: Test API
   version: 1.0.0
@@ -486,4 +555,85 @@ paths:
 	assert.NoError(t, e)
 	assert.Equal(t, "3.0.0", r.Version)
 	assert.Equal(t, YAMLFileType, r.SpecFileType)
+}
+
+func TestExtractSpecInfo_NoConfig(t *testing.T) {
+	normalJSON := []byte(badYAMLDuplicateKey)
+
+	r, e := ExtractSpecInfoWithConfig([]byte(normalJSON), nil)
+	assert.Error(t, e)
+	assert.Nil(t, r)
+}
+
+func TestExtractSpecInfo_ConfigSkip(t *testing.T) {
+	normalJSON := []byte(badYAMLDuplicateKey2)
+
+	r, e := ExtractSpecInfoWithConfig([]byte(normalJSON), &DocumentConfiguration{
+		SkipJSONConversion: false,
+	})
+	assert.Error(t, e)
+	assert.Nil(t, r)
+}
+
+func TestExtractSpecInfo_ConfigSkipAsyncApi(t *testing.T) {
+	normalJSON := []byte(badYAMLDuplicateKeyAsync)
+
+	r, e := ExtractSpecInfoWithConfig([]byte(normalJSON), &DocumentConfiguration{
+		SkipJSONConversion: false,
+	})
+	assert.Error(t, e)
+	assert.Nil(t, r)
+}
+
+func TestExtractSpecInfo_ConfigSkipAsyncUnknown(t *testing.T) {
+	normalJSON := []byte(badYAMLDuplicateKeyUnknown)
+
+	r, e := ExtractSpecInfoWithConfig([]byte(normalJSON), &DocumentConfiguration{
+		SkipJSONConversion: false,
+	})
+	assert.Error(t, e)
+	assert.Nil(t, r)
+}
+
+func TestSpecInfo_Release(t *testing.T) {
+	specBytes := []byte("openapi: 3.1.0")
+	jsonBytes := []byte("{}")
+	jsonMap := map[string]interface{}{"openapi": "3.1.0"}
+	rootNode := &yaml.Node{Value: "root"}
+
+	s := &SpecInfo{
+		RootNode:      rootNode,
+		SpecBytes:     &specBytes,
+		SpecJSONBytes: &jsonBytes,
+		SpecJSON:      &jsonMap,
+		Version:       "3.1.0",
+	}
+
+	s.Release()
+
+	assert.Nil(t, s.RootNode)
+	assert.Nil(t, s.SpecBytes)
+	assert.Nil(t, s.SpecJSONBytes)
+	assert.Nil(t, s.SpecJSON)
+	// non-pointer fields are untouched
+	assert.Equal(t, "3.1.0", s.Version)
+}
+
+func TestSpecInfo_Release_Nil(t *testing.T) {
+	var s *SpecInfo
+	s.Release() // must not panic
+}
+
+func TestSpecInfo_Release_Idempotent(t *testing.T) {
+	s := &SpecInfo{RootNode: &yaml.Node{}}
+	s.Release()
+	s.Release() // second call must not panic
+	assert.Nil(t, s.RootNode)
+}
+
+func TestSpecInfo_Release_EmptyFields(t *testing.T) {
+	s := &SpecInfo{}
+	s.Release() // all fields already nil/zero, must not panic
+	assert.Nil(t, s.RootNode)
+	assert.Nil(t, s.SpecBytes)
 }

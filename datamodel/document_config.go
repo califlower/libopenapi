@@ -81,6 +81,12 @@ type DocumentConfiguration struct {
 	// FileFilter should be used to limit the scope of the rolodex.
 	AllowFileReferences bool
 
+	// SkipExternalRefResolution will skip resolving external $ref references (those not starting with #).
+	// When enabled, external references will be left as-is during model building. Schema proxies will
+	// report IsReference()=true and GetReference() will return the ref string, but Schema() will return nil.
+	// This is useful for code generators that handle external refs via import mappings.
+	SkipExternalRefResolution bool
+
 	// AllowRemoteReferences will allow the index to lookup remote references. This is disabled by default.
 	//
 	// This behavior is now driven by the inclusion of a BaseURL. If a BaseURL is set, then the
@@ -98,6 +104,13 @@ type DocumentConfiguration struct {
 	// BypassDocumentCheck will bypass the document check. This is disabled by default. This will allow any document to
 	// passed in and used. Only enable this when parsing non openapi documents.
 	BypassDocumentCheck bool
+
+	// SkipJSONConversion skips the YAML-to-JSON conversion during spec parsing.
+	// SpecJSON and SpecJSONBytes on SpecInfo will be nil when enabled.
+	// This also skips structural validation that parseJSON performs (e.g., duplicate key detection).
+	// Safe when document-level schema validation rules are not running and no custom
+	// functions depend on the JSON representation.
+	SkipJSONConversion bool
 
 	// IgnorePolymorphicCircularReferences will skip over checking for circular references in polymorphic schemas.
 	// A polymorphic schema is any schema that is composed other schemas using references via `oneOf`, `anyOf` of `allOf`.
@@ -196,6 +209,10 @@ type DocumentConfiguration struct {
 	// - OverwriteWithRemote: Referenced properties overwrite local properties
 	// - RejectConflicts: Throw error when properties conflict
 	PropertyMergeStrategy PropertyMergeStrategy
+
+	// ResolveNestedRefsWithDocumentContext uses the referenced document's path/index as the base for nested refs.
+	// This controls how nested relative references are interpreted during reference resolution.
+	ResolveNestedRefsWithDocumentContext bool
 }
 
 func NewDocumentConfiguration() *DocumentConfiguration {

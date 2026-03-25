@@ -145,6 +145,8 @@ func createDocument(info *datamodel.SpecInfo, config *datamodel.DocumentConfigur
 	idxConfig.IgnoreArrayCircularReferences = config.IgnoreArrayCircularReferences
 	idxConfig.IgnorePolymorphicCircularReferences = config.IgnorePolymorphicCircularReferences
 	idxConfig.AllowUnknownExtensionContentDetection = config.AllowUnknownExtensionContentDetection
+	idxConfig.SkipExternalRefResolution = config.SkipExternalRefResolution
+	idxConfig.ResolveNestedRefsWithDocumentContext = config.ResolveNestedRefsWithDocumentContext
 	idxConfig.AvoidCircularReferenceCheck = true
 	idxConfig.BaseURL = config.BaseURL
 	idxConfig.BasePath = config.BasePath
@@ -160,7 +162,23 @@ func createDocument(info *datamodel.SpecInfo, config *datamodel.DocumentConfigur
 		cwd, _ = filepath.Abs(config.BasePath)
 		// if a supplied local filesystem is provided, add it to the rolodex.
 		if config.LocalFS != nil {
-			rolodex.AddLocalFS(cwd, config.LocalFS)
+			var localFS index.RolodexFS
+			if fs, ok := config.LocalFS.(index.RolodexFS); ok {
+				localFS = fs
+			} else {
+				// wrap a plain fs.FS so it can be indexed.
+				localFSConf := index.LocalFSConfig{
+					BaseDirectory: cwd,
+					IndexConfig:   idxConfig,
+					FileFilters:   config.FileFilter,
+					DirFS:         config.LocalFS,
+				}
+
+				localFS, _ = index.NewLocalFSWithConfig(&localFSConf)
+				idxConfig.AllowFileLookup = true
+			}
+
+			rolodex.AddLocalFS(cwd, localFS)
 		} else {
 
 			// create a local filesystem

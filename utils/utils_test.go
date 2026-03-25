@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pb33f/jsonpath/pkg/jsonpath"
 	"github.com/stretchr/testify/assert"
 	"go.yaml.in/yaml/v4"
 )
@@ -23,6 +24,13 @@ func getPetstore() petstore {
 		psBytes, _ = os.ReadFile("../test_specs/petstorev3.json")
 	})
 	return psBytes
+}
+
+func countJSONPathCacheEntries() int {
+	count := 0
+	jsonPathCacheLazy.Range(func(_, _ interface{}) bool { count++; return true })
+	jsonPathCacheEager.Range(func(_, _ interface{}) bool { count++; return true })
+	return count
 }
 
 func TestRenderCodeSnippet(t *testing.T) {
@@ -56,8 +64,29 @@ func TestFindNodes_BadPath(t *testing.T) {
 	assert.Nil(t, nodes)
 }
 
+func TestClearJSONPathCache(t *testing.T) {
+	// populate the cache
+	_, _ = getJSONPath("$.info.contact")
+	_, _ = getJSONPath("$.paths")
+
+	// verify entries exist
+	count := countJSONPathCacheEntries()
+	assert.GreaterOrEqual(t, count, 2)
+
+	// clear and verify empty
+	ClearJSONPathCache()
+
+	count = countJSONPathCacheEntries()
+	assert.Equal(t, 0, count)
+
+	// verify cache still works after clearing
+	p, err := getJSONPath("$.info.contact")
+	assert.NoError(t, err)
+	assert.NotNil(t, p)
+}
+
 func TestGetJSONPath_CacheHit(t *testing.T) {
-	jsonPathCache = sync.Map{}
+	ClearJSONPathCache()
 
 	path1, err := getJSONPath("$.info.contact")
 	assert.NoError(t, err)
@@ -69,7 +98,7 @@ func TestGetJSONPath_CacheHit(t *testing.T) {
 }
 
 func TestGetJSONPath_CacheHit_Invalid(t *testing.T) {
-	jsonPathCache = sync.Map{}
+	ClearJSONPathCache()
 
 	path1, err := getJSONPath("I am not valid")
 	assert.Error(t, err)
@@ -148,6 +177,47 @@ func TestFindNodesWithoutDeserializing_InvalidPath(t *testing.T) {
 	nodes, err := FindNodesWithoutDeserializing(root[0], "I love a good curry")
 	assert.Error(t, err)
 	assert.Nil(t, nodes)
+}
+
+func TestFindNodesWithoutDeserializingWithOptions_LazyToggle(t *testing.T) {
+	root, _ := FindNodes(getPetstore(), "$")
+	lazyDisabled := false
+	nodes, err := FindNodesWithoutDeserializingWithOptions(root[0], "$.info.contact", JSONPathLookupOptions{
+		Timeout:             100 * time.Millisecond,
+		LazyContextTracking: &lazyDisabled,
+	})
+	assert.NoError(t, err)
+	assert.NotNil(t, nodes)
+	assert.Len(t, nodes, 1)
+}
+
+func TestGetJSONPathWithOptions_CacheKeyIncludesLazyMode(t *testing.T) {
+	ClearJSONPathCache()
+
+	lazyDisabled := false
+	_, err := getJSONPathWithOptions("$.info.contact", JSONPathLookupOptions{
+		Timeout:             100 * time.Millisecond,
+		LazyContextTracking: &lazyDisabled,
+	})
+	assert.NoError(t, err)
+
+	lazyEnabled := true
+	_, err = getJSONPathWithOptions("$.info.contact", JSONPathLookupOptions{
+		Timeout:             100 * time.Millisecond,
+		LazyContextTracking: &lazyEnabled,
+	})
+	assert.NoError(t, err)
+
+	count := countJSONPathCacheEntries()
+	assert.Equal(t, 2, count)
+}
+
+func TestFindNodesWithoutDeserializingWithOptions_ZeroValueUsesDefaults(t *testing.T) {
+	root, _ := FindNodes(getPetstore(), "$")
+	nodes, err := FindNodesWithoutDeserializingWithOptions(root[0], "$.info.contact", JSONPathLookupOptions{})
+	assert.NoError(t, err)
+	assert.NotNil(t, nodes)
+	assert.Len(t, nodes, 1)
 }
 
 func TestConvertInterfaceIntoStringMap(t *testing.T) {
@@ -1541,35 +1611,25 @@ func TestIsNodeNull(t *testing.T) {
 	assert.True(t, IsNodeNull(noNode))
 }
 
-func TestFindNodesWithoutDeserializingWithTimeout(t *testing.T) {
-	// Skip this test when running with -short flag to avoid stack overflow with race detector
-	if testing.Short() {
-		t.Skip("Skipping circular reference timeout test in short mode")
+func TestFindNodesWithoutDeserializingWithTimeout_Timeout(t *testing.T) {
+	root, _ := FindNodes(getPetstore(), "$")
+	block := make(chan struct{})
+	done := make(chan struct{})
+	original := jsonPathQuery
+	jsonPathQuery = func(path *jsonpath.JSONPath, node *yaml.Node) []*yaml.Node {
+		<-block
+		close(done)
+		return nil
 	}
+	defer func() {
+		jsonPathQuery = original
+		close(block)
+		<-done
+	}()
 
-	// create a and b node that reference each other
-	a := &yaml.Node{
-		Value: "beans",
-		Tag:   "!!map",
-		Kind:  yaml.MappingNode,
-	}
-	b := &yaml.Node{
-		Tag:   "!!map",
-		Value: "cake",
-		Kind:  yaml.MappingNode,
-	}
-	a.Content = []*yaml.Node{b}
-	b.Content = []*yaml.Node{a}
-
-	// now look for something that does not exist.
-	// Use a longer timeout when race detector might be enabled
-	timeout := 10 * time.Millisecond
-	if os.Getenv("GORACE") != "" {
-		timeout = 100 * time.Millisecond
-	}
-	nodes, err := FindNodesWithoutDeserializingWithTimeout(a, "$..chicken", timeout)
+	nodes, err := FindNodesWithoutDeserializingWithTimeout(root[0], "$.info.contact", 1*time.Millisecond)
 	assert.Nil(t, nodes)
-	assert.Error(t, err)
+	assert.ErrorContains(t, err, "timeout exceeded")
 }
 
 func TestFindNodesWithoutDeserializingWithTimeout_Success(t *testing.T) {
@@ -1865,4 +1925,78 @@ func TestGetRefValueNode_EmptyNode(t *testing.T) {
 	}
 	result := GetRefValueNode(node)
 	assert.Nil(t, result)
+}
+
+func TestIsExternalRef_RelativeFile(t *testing.T) {
+	assert.True(t, IsExternalRef("./file.yaml#/Foo"))
+}
+
+func TestIsExternalRef_AbsoluteURL(t *testing.T) {
+	assert.True(t, IsExternalRef("https://example.com/schema.yaml"))
+}
+
+func TestIsExternalRef_LocalFragment(t *testing.T) {
+	assert.False(t, IsExternalRef("#/components/schemas/Foo"))
+}
+
+func TestIsExternalRef_AnchorOnly(t *testing.T) {
+	assert.False(t, IsExternalRef("#SomeAnchor"))
+}
+
+func TestIsExternalRef_Empty(t *testing.T) {
+	assert.False(t, IsExternalRef(""))
+}
+
+func TestParseSmallUint(t *testing.T) {
+	t.Run("empty string", func(t *testing.T) {
+		n, ok := parseSmallUint("")
+		assert.False(t, ok)
+		assert.Equal(t, 0, n)
+	})
+	t.Run("single digit", func(t *testing.T) {
+		n, ok := parseSmallUint("5")
+		assert.True(t, ok)
+		assert.Equal(t, 5, n)
+	})
+	t.Run("multi digit", func(t *testing.T) {
+		n, ok := parseSmallUint("42")
+		assert.True(t, ok)
+		assert.Equal(t, 42, n)
+	})
+	t.Run("zero", func(t *testing.T) {
+		n, ok := parseSmallUint("0")
+		assert.True(t, ok)
+		assert.Equal(t, 0, n)
+	})
+	t.Run("non-numeric", func(t *testing.T) {
+		n, ok := parseSmallUint("abc")
+		assert.False(t, ok)
+		assert.Equal(t, 0, n)
+	})
+	t.Run("mixed", func(t *testing.T) {
+		n, ok := parseSmallUint("12x")
+		assert.False(t, ok)
+		assert.Equal(t, 0, n)
+	})
+}
+
+func TestDetermineWhitespaceLengthBytes(t *testing.T) {
+	t.Run("yaml file", func(t *testing.T) {
+		someBytes, _ := os.ReadFile("../test_specs/burgershop.openapi.yaml")
+		assert.Equal(t, 2, DetermineWhitespaceLengthBytes(someBytes))
+	})
+	t.Run("json file", func(t *testing.T) {
+		someBytes, _ := os.ReadFile("../test_specs/petstorev3.json")
+		assert.Equal(t, 2, DetermineWhitespaceLengthBytes(someBytes))
+	})
+	t.Run("no indentation", func(t *testing.T) {
+		assert.Equal(t, 0, DetermineWhitespaceLengthBytes([]byte(`{"hello": "world"}`)))
+	})
+	t.Run("empty", func(t *testing.T) {
+		assert.Equal(t, 0, DetermineWhitespaceLengthBytes([]byte{}))
+	})
+	t.Run("four space indent", func(t *testing.T) {
+		input := []byte("root:\n    child: value\n        grandchild: value")
+		assert.Equal(t, 4, DetermineWhitespaceLengthBytes(input))
+	})
 }

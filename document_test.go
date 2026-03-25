@@ -1928,3 +1928,237 @@ components:
 		t.Fatal("components or schemas not found in reloaded model")
 	}
 }
+
+func TestSkipExternalRefResolution_Integration(t *testing.T) {
+	spec := `openapi: "3.1.0"
+info:
+  title: Test
+  version: "1.0"
+paths:
+  /pets:
+    get:
+      operationId: listPets
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  localProp:
+                    type: string
+                  externalProp:
+                    $ref: './models/Pet.yaml#/Pet'
+                allOf:
+                  - $ref: './models/Base.yaml#/Base'
+                  - type: object
+                    properties:
+                      name:
+                        type: string
+components:
+  schemas:
+    LocalSchema:
+      type: object
+      properties:
+        id:
+          type: integer`
+
+	config := datamodel.NewDocumentConfiguration()
+	config.SkipExternalRefResolution = true
+
+	doc, err := NewDocumentWithConfiguration([]byte(spec), config)
+	require.NoError(t, err)
+
+	model, errs := doc.BuildV3Model()
+	_ = errs
+	require.NotNil(t, model)
+
+	// Navigate to the response schema
+	path := model.Model.Paths.PathItems.GetOrZero("/pets")
+	require.NotNil(t, path)
+
+	getOp := path.Get
+	require.NotNil(t, getOp)
+
+	resp := getOp.Responses.Codes.GetOrZero("200")
+	require.NotNil(t, resp)
+
+	jsonContent := resp.Content.GetOrZero("application/json")
+	require.NotNil(t, jsonContent)
+
+	schema := jsonContent.Schema
+	require.NotNil(t, schema)
+
+	schemaResolved := schema.Schema()
+	require.NotNil(t, schemaResolved)
+
+	// Check properties are iterable
+	require.NotNil(t, schemaResolved.Properties)
+
+	// Check external ref property
+	externalProp := schemaResolved.Properties.GetOrZero("externalProp")
+	require.NotNil(t, externalProp, "externalProp should exist in properties")
+	assert.True(t, externalProp.IsReference())
+	assert.Equal(t, "./models/Pet.yaml#/Pet", externalProp.GetReference())
+	assert.Nil(t, externalProp.Schema()) // unresolved external ref
+	assert.Nil(t, externalProp.GetBuildError())
+
+	// Check local properties still work
+	localProp := schemaResolved.Properties.GetOrZero("localProp")
+	require.NotNil(t, localProp, "localProp should exist in properties")
+	assert.False(t, localProp.IsReference())
+	localSchema := localProp.Schema()
+	require.NotNil(t, localSchema)
+	assert.Contains(t, localSchema.Type, "string")
+
+	// Check allOf with external ref
+	require.NotNil(t, schemaResolved.AllOf)
+	require.Len(t, schemaResolved.AllOf, 2)
+
+	allOfFirst := schemaResolved.AllOf[0]
+	assert.True(t, allOfFirst.IsReference())
+	assert.Equal(t, "./models/Base.yaml#/Base", allOfFirst.GetReference())
+	assert.Nil(t, allOfFirst.Schema())
+	assert.Nil(t, allOfFirst.GetBuildError())
+
+	// Second allOf should build normally (local)
+	allOfSecond := schemaResolved.AllOf[1]
+	assert.False(t, allOfSecond.IsReference())
+	secondSchema := allOfSecond.Schema()
+	require.NotNil(t, secondSchema)
+
+	// Check that the LocalSchema component still resolves
+	localSchemaComp := model.Model.Components.Schemas.GetOrZero("LocalSchema")
+	require.NotNil(t, localSchemaComp, "LocalSchema component should exist")
+	resolved := localSchemaComp.Schema()
+	require.NotNil(t, resolved)
+}
+
+func TestNewDocument_DefaultConfig_EnablesSiblingRefTransform(t *testing.T) {
+	// Verifies that NewDocument() (without explicit configuration) uses
+	// NewDocumentConfiguration() defaults, which enables TransformSiblingRefs.
+	// See: https://github.com/pb33f/libopenapi/issues/90
+	spec := `openapi: 3.1.0
+info:
+  title: Sibling Ref Default Config Test
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    Base:
+      type: string
+      enum:
+        - ACTIVE
+        - PAUSED
+        - DELETED
+    WithSiblings:
+      $ref: '#/components/schemas/Base'
+      description: "A constrained version of Base"
+      enum:
+        - ACTIVE
+        - PAUSED`
+
+	doc, err := NewDocument([]byte(spec))
+	require.NoError(t, err)
+
+	model, err := doc.BuildV3Model()
+	require.NoError(t, err)
+	require.NotNil(t, model)
+
+	// Verify the default config has TransformSiblingRefs enabled
+	config := doc.GetConfiguration()
+	require.NotNil(t, config)
+	assert.True(t, config.TransformSiblingRefs,
+		"TransformSiblingRefs should default to true even when using NewDocument()")
+
+	// Verify the sibling $ref was converted to allOf
+	withSiblings := model.Model.Components.Schemas.GetOrZero("WithSiblings")
+	require.NotNil(t, withSiblings)
+
+	schema := withSiblings.Schema()
+	require.NotNil(t, schema)
+	require.NotNil(t, schema.AllOf, "sibling $ref should be transformed into allOf")
+	assert.Len(t, schema.AllOf, 2, "allOf should have 2 items: sibling props + $ref")
+
+	// First allOf item should contain the sibling properties
+	siblingSchema := schema.AllOf[0].Schema()
+	require.NotNil(t, siblingSchema)
+	assert.Equal(t, "A constrained version of Base", siblingSchema.Description)
+	assert.Len(t, siblingSchema.Enum, 2)
+
+	// Second allOf item should be the $ref
+	refItem := schema.AllOf[1]
+	assert.Equal(t, "#/components/schemas/Base", refItem.GetReference())
+}
+
+func TestDocument_Release(t *testing.T) {
+	spec := `openapi: "3.1.0"
+info:
+  title: Test
+  version: "1.0"
+paths: {}`
+
+	doc, err := NewDocument([]byte(spec))
+	require.NoError(t, err)
+	require.NotNil(t, doc)
+
+	// build model so rolodex and high model are populated
+	_, _ = doc.BuildV3Model()
+
+	// confirm fields are populated before release
+	assert.NotNil(t, doc.GetSpecInfo())
+	assert.NotNil(t, doc.GetRolodex())
+
+	doc.Release()
+
+	// after release, internal state is cleared
+	d := doc.(*document)
+	assert.Nil(t, d.info)
+	assert.Nil(t, d.rolodex)
+	assert.Nil(t, d.config)
+	assert.Nil(t, d.highOpenAPI3Model)
+}
+
+func TestDocument_Release_Nil(t *testing.T) {
+	var d *document
+	d.Release() // must not panic
+}
+
+func TestDocument_Release_Idempotent(t *testing.T) {
+	spec := `openapi: "3.1.0"
+info:
+  title: Test
+  version: "1.0"
+paths: {}`
+
+	doc, _ := NewDocument([]byte(spec))
+	doc.Release()
+	doc.Release() // second call must not panic
+
+	d := doc.(*document)
+	assert.Nil(t, d.info)
+}
+
+func TestDocument_Release_PreservesSpecIndexForComparison(t *testing.T) {
+	spec := `openapi: "3.1.0"
+info:
+  title: Test
+  version: "1.0"
+paths: {}`
+
+	doc, _ := NewDocument([]byte(spec))
+	_, _ = doc.BuildV3Model()
+
+	rolodex := doc.GetRolodex()
+	require.NotNil(t, rolodex)
+	rootIdx := rolodex.GetRootIndex()
+	require.NotNil(t, rootIdx)
+
+	// Release the document
+	doc.Release()
+
+	// SpecIndex internals must NOT be released by Document.Release()
+	// (they're needed for hashing during what-changed comparisons)
+	assert.NotNil(t, rootIdx.GetConfig())
+}

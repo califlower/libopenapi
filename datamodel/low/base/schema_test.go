@@ -2,7 +2,6 @@ package base
 
 import (
 	"context"
-	"sync"
 	"testing"
 	timeStd "time"
 
@@ -54,29 +53,29 @@ allOf:
         description: allOfB description
         example: 'allOfBExp'
 oneOf:
-  type: object
-  description: a oneof thing
-  properties:
-    oneOfA:
-      type: string
-      description: oneOfA description
-      example: 'oneOfAExp'
-    oneOfB:
-      type: string
-      description: oneOfB description
-      example: 'oneOfBExp'
+  - type: object
+    description: a oneof thing
+    properties:
+      oneOfA:
+        type: string
+        description: oneOfA description
+        example: 'oneOfAExp'
+      oneOfB:
+        type: string
+        description: oneOfB description
+        example: 'oneOfBExp'
 anyOf:
-  type: object
-  description: an anyOf thing
-  properties:
-    anyOfA:
-      type: string
-      description: anyOfA description
-      example: 'anyOfAExp'
-    anyOfB:
-      type: string
-      description: anyOfB description
-      example: 'anyOfBExp'
+  - type: object
+    description: an anyOf thing
+    properties:
+      anyOfA:
+        type: string
+        description: anyOfA description
+        example: 'anyOfAExp'
+      anyOfB:
+        type: string
+        description: anyOfB description
+        example: 'anyOfBExp'
 not:
   type: object
   description: a not thing
@@ -102,17 +101,17 @@ items:
       description: itemsB description
       example: 'itemsBExp'
 prefixItems:
-  type: object
-  description: an items thing
-  properties:
-    itemsA:
-      type: string
-      description: itemsA description
-      example: 'itemsAExp'
-    itemsB:
-      type: string
-      description: itemsB description
-      example: 'itemsBExp'
+  - type: object
+    description: an items thing
+    properties:
+      itemsA:
+        type: string
+        description: itemsA description
+        example: 'itemsAExp'
+      itemsB:
+        type: string
+        description: itemsB description
+        example: 'itemsBExp'
 properties:
   somethingA:
     type: number
@@ -612,9 +611,9 @@ oneOf:
 anyOf:
   - $ref: '#/components/schemas/Something'
 not:
-  - $ref: '#/components/schemas/Something'
+  $ref: '#/components/schemas/Something'
 items:
-  - $ref: '#/components/schemas/Something'`
+  $ref: '#/components/schemas/Something'`
 
 	var sch Schema
 	var idxNode yaml.Node
@@ -693,11 +692,11 @@ func Test_Schema_Polymorphism_Map_Ref(t *testing.T) {
 
 	yml = `type: object
 allOf:
-  $ref: '#/components/schemas/Something'
+  - $ref: '#/components/schemas/Something'
 oneOf:
-  $ref: '#/components/schemas/Something'
+  - $ref: '#/components/schemas/Something'
 anyOf:
-  $ref: '#/components/schemas/Something'
+  - $ref: '#/components/schemas/Something'
 not:
   $ref: '#/components/schemas/Something'
 items:
@@ -858,7 +857,7 @@ func Test_Schema_Polymorphism_RefMadness(t *testing.T) {
 
 	yml = `type: object
 allOf:
-  $ref: '#/components/schemas/Something'`
+  - $ref: '#/components/schemas/Something'`
 
 	var sch Schema
 	var idxNode yaml.Node
@@ -1400,6 +1399,7 @@ func TestExtractSchema_OneOfRef(t *testing.T) {
 }
 
 func TestSchema_Hash_Equal(t *testing.T) {
+	low.ClearHashCache()
 	left := `schema:
   $schema: https://athing.com
   multipleOf: 1
@@ -1883,21 +1883,9 @@ func TestBuildSchema_BadNodeTypes(t *testing.T) {
 		Column: 2,
 	}
 
-	eChan := make(chan error, 1)
-	doneChan := make(chan struct{}, 1)
-	bChan := make(chan schemaProxyBuildResult, 1)
-	var err error
-	go func() {
-		for {
-			e := <-eChan
-			err = e
-			doneChan <- struct{}{}
-		}
-	}()
-
-	buildSchema(context.Background(), bChan, n, n, eChan, nil)
-	<-doneChan
-	assert.Equal(t, "build schema failed: unexpected data type: 'unknown', line 1, col 2", err.Error())
+	_, err := buildSchema(context.Background(), n, n, nil)
+	assert.Error(t, err)
+	assert.Equal(t, "build schema failed: expected a single schema object for 'unknown', but found an array or scalar at line 1, col 2", err.Error())
 }
 
 func TestExtractSchema_CheckPathAndSpec(t *testing.T) {
@@ -1982,7 +1970,7 @@ func TestSchema_Hash_Empty(t *testing.T) {
 }
 
 func TestSetup(t *testing.T) {
-	SchemaQuickHashMap = sync.Map{}
+	ClearSchemaQuickHashMap()
 }
 
 func TestSchema_QuickHash(t *testing.T) {
@@ -3042,4 +3030,248 @@ contentSchema:
 
 	// Different contentSchema types should produce different hashes
 	assert.NotEqual(t, hash1, hash2)
+}
+
+func TestBuildPropertyMap_SkipExternalRef(t *testing.T) {
+	// Schema with a property that has an external $ref
+	schemaYml := `type: object
+properties:
+  local:
+    type: string
+  external:
+    $ref: './models/Pet.yaml#/Pet'`
+
+	var schemaNode yaml.Node
+	_ = yaml.Unmarshal([]byte(schemaYml), &schemaNode)
+
+	cfg := index.CreateClosedAPIIndexConfig()
+	cfg.SkipExternalRefResolution = true
+	idx := index.NewSpecIndexWithConfig(&schemaNode, cfg)
+
+	var schema Schema
+	_ = low.BuildModel(schemaNode.Content[0], &schema)
+	err := schema.Build(context.Background(), schemaNode.Content[0], idx)
+	assert.Nil(t, err) // parent builds successfully
+
+	// Check properties
+	assert.NotNil(t, schema.Properties.Value)
+	found := false
+	for k, v := range schema.Properties.Value.FromOldest() {
+		if k.Value == "external" {
+			found = true
+			proxy := v.Value
+			assert.True(t, proxy.IsReference())
+			assert.Equal(t, "./models/Pet.yaml#/Pet", proxy.GetReference())
+			// Schema() should return nil for unresolved external ref
+			assert.Nil(t, proxy.Schema())
+			assert.Nil(t, proxy.GetBuildError())
+		}
+	}
+	assert.True(t, found, "expected to find 'external' property")
+}
+
+func TestBuildSchema_AllOf_SkipExternalRef(t *testing.T) {
+	schemaYml := `allOf:
+  - $ref: './models/Base.yaml#/Base'
+  - type: object
+    properties:
+      name:
+        type: string`
+
+	var schemaNode yaml.Node
+	_ = yaml.Unmarshal([]byte(schemaYml), &schemaNode)
+	cfg := index.CreateClosedAPIIndexConfig()
+	cfg.SkipExternalRefResolution = true
+	idx := index.NewSpecIndexWithConfig(&schemaNode, cfg)
+
+	var schema Schema
+	_ = low.BuildModel(schemaNode.Content[0], &schema)
+	err := schema.Build(context.Background(), schemaNode.Content[0], idx)
+	assert.Nil(t, err)
+
+	assert.NotNil(t, schema.AllOf.Value)
+	assert.Len(t, schema.AllOf.Value, 2)
+
+	// First allOf item should be the external ref
+	first := schema.AllOf.Value[0].Value
+	assert.True(t, first.IsReference())
+	assert.Equal(t, "./models/Base.yaml#/Base", first.GetReference())
+	assert.Nil(t, first.Schema())
+	assert.Nil(t, first.GetBuildError())
+}
+
+func TestBuildSchema_OneOf_SkipExternalRef(t *testing.T) {
+	schemaYml := `oneOf:
+  - $ref: 'https://example.com/Cat.yaml'
+  - type: object
+    properties:
+      bark:
+        type: boolean`
+
+	var schemaNode yaml.Node
+	_ = yaml.Unmarshal([]byte(schemaYml), &schemaNode)
+	cfg := index.CreateClosedAPIIndexConfig()
+	cfg.SkipExternalRefResolution = true
+	idx := index.NewSpecIndexWithConfig(&schemaNode, cfg)
+
+	var schema Schema
+	_ = low.BuildModel(schemaNode.Content[0], &schema)
+	err := schema.Build(context.Background(), schemaNode.Content[0], idx)
+	assert.Nil(t, err)
+
+	assert.NotNil(t, schema.OneOf.Value)
+	assert.Len(t, schema.OneOf.Value, 2)
+
+	first := schema.OneOf.Value[0].Value
+	assert.True(t, first.IsReference())
+	assert.Equal(t, "https://example.com/Cat.yaml", first.GetReference())
+	assert.Nil(t, first.Schema())
+	assert.Nil(t, first.GetBuildError())
+}
+
+func TestBuildSchema_AllOfMap_SkipExternalRef(t *testing.T) {
+	// allOf as a single map $ref (not an array) exercises the map branch of buildSchema (Site B)
+	schemaYml := `allOf:
+  - $ref: './models/Base.yaml#/Base'`
+
+	var schemaNode yaml.Node
+	_ = yaml.Unmarshal([]byte(schemaYml), &schemaNode)
+	cfg := index.CreateClosedAPIIndexConfig()
+	cfg.SkipExternalRefResolution = true
+	idx := index.NewSpecIndexWithConfig(&schemaNode, cfg)
+
+	var schema Schema
+	_ = low.BuildModel(schemaNode.Content[0], &schema)
+	err := schema.Build(context.Background(), schemaNode.Content[0], idx)
+	assert.Nil(t, err)
+
+	assert.NotNil(t, schema.AllOf.Value)
+	assert.Len(t, schema.AllOf.Value, 1)
+
+	first := schema.AllOf.Value[0].Value
+	assert.True(t, first.IsReference())
+	assert.Equal(t, "./models/Base.yaml#/Base", first.GetReference())
+	assert.Nil(t, first.Schema())
+	assert.Nil(t, first.GetBuildError())
+}
+
+func TestExtractSchema_RootRef_SkipExternalRef(t *testing.T) {
+	yml := `$ref: './models/Pet.yaml#/Pet'`
+
+	var root yaml.Node
+	_ = yaml.Unmarshal([]byte(yml), &root)
+
+	cfg := index.CreateClosedAPIIndexConfig()
+	cfg.SkipExternalRefResolution = true
+	idx := index.NewSpecIndexWithConfig(&root, cfg)
+
+	result, err := ExtractSchema(context.Background(), root.Content[0], idx)
+	assert.Nil(t, err)
+	assert.NotNil(t, result)
+	assert.True(t, result.Value.IsReference())
+	assert.Equal(t, "./models/Pet.yaml#/Pet", result.Value.GetReference())
+	assert.Nil(t, result.Value.Schema())
+	assert.Nil(t, result.Value.GetBuildError())
+}
+
+func TestExtractSchema_SchemaKeyRef_SkipExternalRef(t *testing.T) {
+	yml := `schema:
+  $ref: './models/Pet.yaml#/Pet'`
+
+	var root yaml.Node
+	_ = yaml.Unmarshal([]byte(yml), &root)
+
+	cfg := index.CreateClosedAPIIndexConfig()
+	cfg.SkipExternalRefResolution = true
+	idx := index.NewSpecIndexWithConfig(&root, cfg)
+
+	result, err := ExtractSchema(context.Background(), root.Content[0], idx)
+	assert.Nil(t, err)
+	assert.NotNil(t, result)
+	assert.True(t, result.Value.IsReference())
+	assert.Equal(t, "./models/Pet.yaml#/Pet", result.Value.GetReference())
+	assert.Nil(t, result.Value.Schema())
+	assert.Nil(t, result.Value.GetBuildError())
+}
+
+func TestClearSchemaQuickHashMap(t *testing.T) {
+	// Store a value.
+	SchemaQuickHashMap.Store("test-key", "test-value")
+
+	// Verify it's there.
+	_, ok := SchemaQuickHashMap.Load("test-key")
+	assert.True(t, ok)
+
+	// Clear and verify it's gone.
+	ClearSchemaQuickHashMap()
+	_, ok = SchemaQuickHashMap.Load("test-key")
+	assert.False(t, ok)
+
+	// Idempotent: clearing an empty map should not panic.
+	ClearSchemaQuickHashMap()
+}
+
+func TestBuildSchema_NilNode(t *testing.T) {
+	res, err := buildSchema(context.Background(), nil, nil, nil)
+	assert.NoError(t, err)
+	assert.Nil(t, res.Value)
+}
+
+func TestBuildSchemaList_NilNode(t *testing.T) {
+	res, err := buildSchemaList(context.Background(), nil, nil, nil)
+	assert.NoError(t, err)
+	assert.Nil(t, res)
+}
+
+func TestBuildSchema_RefNotFound(t *testing.T) {
+	yml := `additionalProperties:
+  $ref: '#/components/schemas/Missing'`
+
+	var schemaNode yaml.Node
+	_ = yaml.Unmarshal([]byte(yml), &schemaNode)
+	cfg := index.CreateOpenAPIIndexConfig()
+	idx := index.NewSpecIndexWithConfig(&schemaNode, cfg)
+
+	var schema Schema
+	_ = low.BuildModel(schemaNode.Content[0], &schema)
+	err := schema.Build(context.Background(), schemaNode.Content[0], idx)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "reference cannot be found")
+}
+
+func TestBuildSchemaList_RefNotFound(t *testing.T) {
+	yml := `allOf:
+  - $ref: '#/components/schemas/Missing'`
+
+	var schemaNode yaml.Node
+	_ = yaml.Unmarshal([]byte(yml), &schemaNode)
+	cfg := index.CreateOpenAPIIndexConfig()
+	idx := index.NewSpecIndexWithConfig(&schemaNode, cfg)
+
+	var schema Schema
+	_ = low.BuildModel(schemaNode.Content[0], &schema)
+	err := schema.Build(context.Background(), schemaNode.Content[0], idx)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "reference cannot be found")
+}
+
+func TestBuildSchema_SkipExternalRef(t *testing.T) {
+	schemaYml := `additionalProperties:
+  $ref: './models/Pet.yaml#/Pet'`
+
+	var schemaNode yaml.Node
+	_ = yaml.Unmarshal([]byte(schemaYml), &schemaNode)
+	cfg := index.CreateClosedAPIIndexConfig()
+	cfg.SkipExternalRefResolution = true
+	idx := index.NewSpecIndexWithConfig(&schemaNode, cfg)
+
+	var schema Schema
+	_ = low.BuildModel(schemaNode.Content[0], &schema)
+	err := schema.Build(context.Background(), schemaNode.Content[0], idx)
+	assert.Nil(t, err)
+
+	assert.NotNil(t, schema.AdditionalProperties.Value)
+	assert.True(t, schema.AdditionalProperties.Value.IsA())
+	assert.True(t, schema.AdditionalProperties.Value.A.IsReference())
+	assert.Equal(t, "./models/Pet.yaml#/Pet", schema.AdditionalProperties.Value.A.GetReference())
 }

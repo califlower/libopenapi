@@ -2242,3 +2242,294 @@ paths:
 	}
 	assert.True(t, foundTestPath, "TestPath should be added to components")
 }
+
+func TestBundlerComposed_AliasSchemaNoCircularSelfRef(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	rootSpec := `openapi: 3.1.0
+info:
+  title: Alias Self-Ref Test
+  version: 1.0.0
+paths:
+  /test:
+    get:
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MySchemaAlias'
+components:
+  schemas:
+    MySchemaAlias:
+      $ref: './external-schemas.yaml#/components/schemas/submitSchema'
+    AnotherAlias:
+      $ref: './external-schemas.yaml#/components/schemas/otherSchema'`
+
+	externalSpec := `openapi: 3.1.0
+info:
+  title: External Schemas
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    submitSchema:
+      type: object
+      properties:
+        productName:
+          type: string
+        uid:
+          type: string
+      required:
+        - productName
+        - uid
+    otherSchema:
+      type: object
+      properties:
+        name:
+          type: string
+        value:
+          type: integer`
+
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "root.yaml"), []byte(rootSpec), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "external-schemas.yaml"), []byte(externalSpec), 0644))
+
+	specBytes, err := os.ReadFile(filepath.Join(tmpDir, "root.yaml"))
+	require.NoError(t, err)
+
+	cfg := &datamodel.DocumentConfiguration{
+		BasePath:                tmpDir,
+		ExtractRefsSequentially: true,
+		AllowFileReferences:     true,
+	}
+
+	doc, err := libopenapi.NewDocumentWithConfiguration(specBytes, cfg)
+	require.NoError(t, err)
+
+	v3Doc, errs := doc.BuildV3Model()
+	require.NoError(t, errs)
+	require.NotNil(t, v3Doc)
+
+	bundledBytes, err := BundleDocumentComposed(&v3Doc.Model, &BundleCompositionConfig{Delimiter: "__"})
+	require.NoError(t, err)
+
+	bundledStr := string(bundledBytes)
+
+	// Parse the bundled output to inspect component schema $refs specifically
+	var bundledDoc map[string]any
+	require.NoError(t, yaml.Unmarshal(bundledBytes, &bundledDoc))
+
+	components := bundledDoc["components"].(map[string]any)
+	schemas := components["schemas"].(map[string]any)
+
+	// MySchemaAlias must NOT be a circular self-reference
+	myAlias := schemas["MySchemaAlias"].(map[string]any)
+	assert.NotEqual(t, "#/components/schemas/MySchemaAlias", myAlias["$ref"],
+		"MySchemaAlias should not self-reference")
+	assert.Contains(t, myAlias["$ref"], "submitSchema",
+		"MySchemaAlias should reference the composed submitSchema")
+
+	// AnotherAlias must NOT be a circular self-reference
+	anotherAlias := schemas["AnotherAlias"].(map[string]any)
+	assert.NotEqual(t, "#/components/schemas/AnotherAlias", anotherAlias["$ref"],
+		"AnotherAlias should not self-reference")
+	assert.Contains(t, anotherAlias["$ref"], "otherSchema",
+		"AnotherAlias should reference the composed otherSchema")
+
+	// Both composed schemas should exist in the output
+	assert.Contains(t, bundledStr, "submitSchema:")
+	assert.Contains(t, bundledStr, "otherSchema:")
+}
+
+func TestBundlerComposed_AliasSchemaCollisionNoSelfRef(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	rootSpec := `openapi: 3.1.0
+info:
+  title: Alias Collision Test
+  version: 1.0.0
+paths:
+  /test:
+    get:
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MyAlias'
+components:
+  schemas:
+    MyAlias:
+      $ref: './external.yaml#/components/schemas/ExternalThing'
+    ExternalThing:
+      type: string
+      description: pre-existing schema with same name`
+
+	externalSpec := `openapi: 3.1.0
+info:
+  title: External
+  version: 1.0.0
+paths: {}
+components:
+  schemas:
+    ExternalThing:
+      type: object
+      properties:
+        id:
+          type: integer`
+
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "root.yaml"), []byte(rootSpec), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(tmpDir, "external.yaml"), []byte(externalSpec), 0644))
+
+	specBytes, err := os.ReadFile(filepath.Join(tmpDir, "root.yaml"))
+	require.NoError(t, err)
+
+	cfg := &datamodel.DocumentConfiguration{
+		BasePath:                tmpDir,
+		ExtractRefsSequentially: true,
+		AllowFileReferences:     true,
+	}
+
+	doc, err := libopenapi.NewDocumentWithConfiguration(specBytes, cfg)
+	require.NoError(t, err)
+
+	v3Doc, errs := doc.BuildV3Model()
+	require.NoError(t, errs)
+	require.NotNil(t, v3Doc)
+
+	bundledBytes, err := BundleDocumentComposed(&v3Doc.Model, &BundleCompositionConfig{Delimiter: "__"})
+	require.NoError(t, err)
+
+	bundledStr := string(bundledBytes)
+
+	// Parse the bundled output to inspect component schema $refs specifically
+	var bundledDoc map[string]any
+	require.NoError(t, yaml.Unmarshal(bundledBytes, &bundledDoc))
+
+	components := bundledDoc["components"].(map[string]any)
+	schemas := components["schemas"].(map[string]any)
+
+	// MyAlias must NOT self-reference
+	myAlias := schemas["MyAlias"].(map[string]any)
+	assert.NotEqual(t, "#/components/schemas/MyAlias", myAlias["$ref"],
+		"MyAlias should not self-reference")
+
+	// The external ExternalThing should be renamed due to collision
+	assert.Contains(t, bundledStr, "ExternalThing__external",
+		"bundled output should contain collision-renamed external schema")
+
+	// MyAlias should reference the collision-renamed schema
+	assert.Contains(t, myAlias["$ref"], "ExternalThing__external",
+		"MyAlias should reference the collision-renamed ExternalThing__external")
+}
+
+// TestBundleComposed_ExternalPathRefsRootComponents tests that external path files
+// containing $ref: "#/components/schemas/X" (pointing back to root document components)
+// do not produce ERROR logs during bundling. This reproduces the bunkhouse bundler issue
+// where the resolver expands local #/ refs in external files into absolute-path refs
+// (e.g., /abs/path/to/list.yaml#/components/schemas/Workspace) which then fail to resolve
+// in SearchIndexForReference because the root index is not checked in the last-ditch search.
+func TestBundleComposed_ExternalPathRefsRootComponents(t *testing.T) {
+	// capture log output to detect ERROR messages
+	var logBuf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	specBytes, err := os.ReadFile("test/specs/root_component_refs/root.yaml")
+	require.NoError(t, err)
+
+	result, err := BundleBytesComposedWithOrigins(specBytes, &datamodel.DocumentConfiguration{
+		BasePath:                "test/specs/root_component_refs",
+		AllowFileReferences:     true,
+		ExtractRefsSequentially: true,
+		Logger:                  logger,
+	}, nil)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotEmpty(t, result.Bytes)
+
+	// the critical assertion: no ERROR logs about "unable to locate reference"
+	logOutput := logBuf.String()
+	assert.NotContains(t, logOutput, "unable to locate reference",
+		"bundling should not produce 'unable to locate reference' errors for root component refs; log output:\n%s", logOutput)
+
+	// verify the bundled output is valid and contains expected schemas
+	var bundledDoc map[string]any
+	require.NoError(t, yaml.Unmarshal(result.Bytes, &bundledDoc))
+
+	components, ok := bundledDoc["components"].(map[string]any)
+	require.True(t, ok, "bundled doc should have components")
+
+	schemas, ok := components["schemas"].(map[string]any)
+	require.True(t, ok, "components should have schemas")
+
+	// external schemas should be lifted into components
+	assert.Contains(t, schemas, "Workspace", "Workspace schema should be in bundled output")
+	assert.Contains(t, schemas, "File", "File schema should be in bundled output")
+	assert.Contains(t, schemas, "Error", "Error schema should be in bundled output")
+
+	// verify $ref values in the bundled output point to local components
+	bundledStr := string(result.Bytes)
+	assert.Contains(t, bundledStr, "#/components/schemas/Workspace",
+		"bundled output should contain local ref to Workspace")
+	assert.Contains(t, bundledStr, "#/components/schemas/File",
+		"bundled output should contain local ref to File")
+	assert.Contains(t, bundledStr, "#/components/schemas/Error",
+		"bundled output should contain local ref to Error")
+}
+
+// TestBundleComposed_DoubleBuildNoErrors mimics the bunkhouse pattern:
+// build the model once (for navigation), then call BundleBytesComposedWithOrigins
+// with the same config (for bundling). Both builds use the same filesystem.
+// This ensures that shared/cached state between builds doesn't produce ERROR logs.
+func TestBundleComposed_DoubleBuildNoErrors(t *testing.T) {
+	var logBuf strings.Builder
+	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	specBytes, err := os.ReadFile("test/specs/root_component_refs/root.yaml")
+	require.NoError(t, err)
+
+	absBasePath, _ := filepath.Abs("test/specs/root_component_refs")
+	specFilePath := filepath.Join(absBasePath, "root.yaml")
+
+	docConfig := &datamodel.DocumentConfiguration{
+		BasePath:                filepath.Dir(specFilePath),
+		SpecFilePath:            specFilePath,
+		AllowFileReferences:     true,
+		ExtractRefsSequentially: true,
+		Logger:                  logger,
+	}
+
+	// first build — mimics bunkhouse line 378 (navigation model)
+	doc1, docErr := libopenapi.NewDocumentWithConfiguration(specBytes, docConfig)
+	require.NoError(t, docErr)
+	v3Doc1, buildErr := doc1.BuildV3Model()
+	require.NotNil(t, v3Doc1, "first build should produce a model; errors: %v", buildErr)
+
+	// second build — mimics bunkhouse line 384 (bundler)
+	// uses the same docConfig (same filesystem)
+	result, bundleErr := BundleBytesComposedWithOrigins(specBytes, docConfig, nil)
+	require.NoError(t, bundleErr)
+	require.NotNil(t, result)
+	require.NotEmpty(t, result.Bytes)
+
+	// critical: no ERROR logs
+	logOutput := logBuf.String()
+	assert.NotContains(t, logOutput, "unable to locate reference",
+		"double-build pattern should not produce 'unable to locate reference' errors;\nlog output:\n%s", logOutput)
+
+	// verify bundled output
+	var bundledDoc map[string]any
+	require.NoError(t, yaml.Unmarshal(result.Bytes, &bundledDoc))
+
+	components, ok := bundledDoc["components"].(map[string]any)
+	require.True(t, ok, "bundled doc should have components")
+
+	schemas, ok := components["schemas"].(map[string]any)
+	require.True(t, ok, "components should have schemas")
+
+	assert.Contains(t, schemas, "Workspace")
+	assert.Contains(t, schemas, "File")
+	assert.Contains(t, schemas, "Error")
+}

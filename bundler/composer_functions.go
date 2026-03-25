@@ -207,13 +207,28 @@ func checkForCollision[T any](schemaName, delimiter string, pr *processRef, comp
 
 func remapIndex(idx *index.SpecIndex, processedNodes *orderedmap.Map[string, *processRef]) {
 	seq := idx.GetRawReferencesSequenced()
+
+	// Track $ref value nodes rewritten by the first loop to prevent
+	// the second loop from overwriting them. This fixes circular self-refs
+	// when a root-local mapped ref shares a yaml node pointer with a
+	// sequenced ref that was already correctly rewritten.
+	rewiredRefNodes := make(map[*yaml.Node]struct{}, len(seq))
+
 	for _, sequenced := range seq {
+		if refValNode := utils.GetRefValueNode(sequenced.Node); refValNode != nil {
+			rewiredRefNodes[refValNode] = struct{}{}
+		}
 		rewireRef(idx, sequenced, sequenced.FullDefinition, processedNodes)
 	}
 
 	mapped := idx.GetMappedReferences()
 
 	for _, mRef := range mapped {
+		if refValNode := utils.GetRefValueNode(mRef.Node); refValNode != nil {
+			if _, ok := rewiredRefNodes[refValNode]; ok {
+				continue
+			}
+		}
 		origDef := mRef.FullDefinition
 		rewireRef(idx, mRef, mRef.FullDefinition, processedNodes)
 		mapped[mRef.FullDefinition] = mRef
@@ -505,6 +520,19 @@ func resolveRefToComposed(
 		return refValue
 	}
 
+	// fast path for local #/ refs: check processedNodes directly to avoid
+	// expensive and noisy SearchIndexForReference calls. After remapIndex
+	// rewrites external refs to #/components/... form, those composed refs
+	// only exist in the high-level model, not in the low-level indexes.
+	// SearchIndexForReference would fail to find them and log ERROR messages.
+	if strings.HasPrefix(refValue, "#/") {
+		absKey := sourceIdx.GetSpecAbsolutePath() + refValue
+		if processedNodes.GetOrZero(absKey) != nil {
+			return renameRef(sourceIdx, absKey, processedNodes)
+		}
+		return refValue
+	}
+
 	// Use source index for relative path resolution
 	ref, refIdx := sourceIdx.SearchIndexForReference(refValue)
 	if ref == nil {
@@ -517,19 +545,6 @@ func resolveRefToComposed(
 				break
 			}
 		}
-	}
-
-	// fallback for unindexed local refs (root cause #4):
-	// If the ref starts with #/ but SearchIndexForReference couldn't resolve it,
-	// try renameRef directly - it may match a processedNodes entry.
-	if ref == nil && strings.HasPrefix(refValue, "#/") {
-		// Build absolute key for lookup: sourceIdx path + refValue
-		absKey := sourceIdx.GetSpecAbsolutePath() + refValue
-		// Gate on processedNodes presence - only rewrite if target was composed
-		if processedNodes.GetOrZero(absKey) == nil {
-			return refValue
-		}
-		return renameRef(sourceIdx, absKey, processedNodes)
 	}
 
 	if ref == nil || refIdx == nil {
@@ -556,7 +571,6 @@ func resolveRefToComposed(
 	// processedNodes (only external refs are), but they're valid targets.
 	rootIdx := rolodex.GetRootIndex()
 	if refIdx != nil && refIdx.GetSpecAbsolutePath() == rootIdx.GetSpecAbsolutePath() {
-		// This ref points to the root document
 		if fragment != "" && strings.HasPrefix(fragment, "#/") {
 			// Return the fragment as-is - it's already a valid local ref
 			return fragment

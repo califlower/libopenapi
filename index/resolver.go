@@ -72,6 +72,20 @@ type Resolver struct {
 	circChecked            bool
 }
 
+// Release nils all fields that can pin YAML node trees or SpecIndex references in
+// memory. Call this once all consumers of the resolver are finished.
+func (resolver *Resolver) Release() {
+	if resolver == nil {
+		return
+	}
+	resolver.specIndex = nil
+	resolver.resolvedRoot = nil
+	resolver.resolvingErrors = nil
+	resolver.circularReferences = nil
+	resolver.ignoredPolyReferences = nil
+	resolver.ignoredArrayReferences = nil
+}
+
 // NewResolver will create a new resolver from a *index.SpecIndex
 func NewResolver(index *SpecIndex) *Resolver {
 	if index == nil {
@@ -599,6 +613,14 @@ func (resolver *Resolver) extractRelatives(ref *Reference, node, parent *yaml.No
 
 				value := node.Content[i+1].Value
 				value = strings.ReplaceAll(value, "\\\\", "\\")
+
+				// If SkipExternalRefResolution is enabled, skip external refs entirely
+				if resolver.specIndex != nil && resolver.specIndex.config != nil &&
+					resolver.specIndex.config.SkipExternalRefResolution && utils.IsExternalRef(value) {
+					skip = true
+					continue
+				}
+
 				var locatedRef *Reference
 				var fullDef string
 				var definition string
@@ -628,7 +650,7 @@ func (resolver *Resolver) extractRelatives(ref *Reference, node, parent *yaml.No
 								fileDef := strings.Split(ref.FullDefinition, "#/")
 
 								// extract the location of the ref and build a full def path.
-								abs, _ := filepath.Abs(utils.CheckPathOverlap(filepath.Dir(fileDef[0]), exp[0], string(filepath.Separator)))
+								abs := resolver.resolveLocalRefPath(filepath.Dir(fileDef[0]), exp[0])
 								// abs = utils.ReplaceWindowsDriveWithLinuxPath(abs)
 								fullDef = fmt.Sprintf("%s#/%s", abs, exp[1])
 
@@ -681,7 +703,7 @@ func (resolver *Resolver) extractRelatives(ref *Reference, node, parent *yaml.No
 							fullDef = u.String()
 
 						} else {
-							fullDef, _ = filepath.Abs(utils.CheckPathOverlap(filepath.Dir(fileDef[0]), exp[0], string(filepath.Separator)))
+							fullDef = resolver.resolveLocalRefPath(filepath.Dir(fileDef[0]), exp[0])
 						}
 
 					}
@@ -925,16 +947,14 @@ func (resolver *Resolver) buildDefPath(ref *Reference, l string) string {
 						z := strings.Split(ref.FullDefinition, "#/")
 						if len(z) == 2 {
 							if len(z[0]) > 0 {
-								abs, _ := filepath.Abs(utils.CheckPathOverlap(filepath.Dir(z[0]),
-									exp[0], string(filepath.Separator)))
+								abs := resolver.resolveLocalRefPath(filepath.Dir(z[0]), exp[0])
 								def = fmt.Sprintf("%s#/%s", abs, exp[1])
 							} else {
 								abs, _ := filepath.Abs(exp[0])
 								def = fmt.Sprintf("%s#/%s", abs, exp[1])
 							}
 						} else {
-							abs, _ := filepath.Abs(utils.CheckPathOverlap(filepath.Dir(ref.FullDefinition),
-								exp[0], string(filepath.Separator)))
+							abs := resolver.resolveLocalRefPath(filepath.Dir(ref.FullDefinition), exp[0])
 							def = fmt.Sprintf("%s#/%s", abs, exp[1])
 						}
 					}
@@ -976,13 +996,21 @@ func (resolver *Resolver) buildDefPath(ref *Reference, l string) string {
 				def = u.String()
 			} else {
 				lookupRef := strings.Split(ref.FullDefinition, "#/")
-				abs, _ := filepath.Abs(utils.CheckPathOverlap(filepath.Dir(lookupRef[0]), l, string(filepath.Separator)))
+				abs := resolver.resolveLocalRefPath(filepath.Dir(lookupRef[0]), l)
 				def = abs
 			}
 		}
 	}
 
 	return def
+}
+
+func (resolver *Resolver) resolveLocalRefPath(base, ref string) string {
+	if resolver != nil && resolver.specIndex != nil {
+		return resolver.specIndex.ResolveRelativeFilePath(base, ref)
+	}
+	abs, _ := filepath.Abs(utils.CheckPathOverlap(base, ref, string(filepath.Separator)))
+	return abs
 }
 
 func (resolver *Resolver) buildDefPathWithSchemaBase(ref *Reference, l string, schemaIdBase string) string {

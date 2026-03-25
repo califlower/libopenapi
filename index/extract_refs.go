@@ -32,6 +32,31 @@ type indexedRef struct {
 	pos int
 }
 
+func isSchemaContainingNode(v string) bool {
+	switch v {
+	case "schema", "items", "additionalProperties", "contains", "not",
+		"unevaluatedItems", "unevaluatedProperties":
+		return true
+	}
+	return false
+}
+
+func isMapOfSchemaContainingNode(v string) bool {
+	switch v {
+	case "properties", "patternProperties":
+		return true
+	}
+	return false
+}
+
+func isArrayOfSchemaContainingNode(v string) bool {
+	switch v {
+	case "allOf", "anyOf", "oneOf", "prefixItems":
+		return true
+	}
+	return false
+}
+
 // ExtractRefs will return a deduplicated slice of references for every unique ref found in the document.
 // The total number of refs, will generally be much higher, you can extract those from GetRawReferenceCount()
 func (index *SpecIndex) ExtractRefs(ctx context.Context, node, parent *yaml.Node, seenPath []string, level int, poly bool, pName string) []*Reference {
@@ -88,8 +113,7 @@ func (index *SpecIndex) ExtractRefs(ctx context.Context, node, parent *yaml.Node
 			// check if we're dealing with an inline schema definition, that isn't part of an array
 			// (which means it's being used as a value in an array, and it's not a label)
 			// https://github.com/pb33f/libopenapi/issues/76
-			schemaContainingNodes := []string{"schema", "items", "additionalProperties", "contains", "not", "unevaluatedItems", "unevaluatedProperties"}
-			if i%2 == 0 && slices.Contains(schemaContainingNodes, n.Value) && !utils.IsNodeArray(node) && (i+1 < len(node.Content)) {
+			if i%2 == 0 && isSchemaContainingNode(n.Value) && !utils.IsNodeArray(node) && (i+1 < len(node.Content)) {
 
 				var jsonPath, definitionPath, fullDefinitionPath string
 
@@ -139,8 +163,7 @@ func (index *SpecIndex) ExtractRefs(ctx context.Context, node, parent *yaml.Node
 
 			// Perform the same check for all maps of schemas like properties and patternProperties
 			// https://github.com/pb33f/libopenapi/issues/76
-			mapOfSchemaContainingNodes := []string{"properties", "patternProperties"}
-			if i%2 == 0 && slices.Contains(mapOfSchemaContainingNodes, n.Value) && !utils.IsNodeArray(node) && (i+1 < len(node.Content)) {
+			if i%2 == 0 && isMapOfSchemaContainingNode(n.Value) && !utils.IsNodeArray(node) && (i+1 < len(node.Content)) {
 
 				// if 'examples' or 'example' exists in the seenPath, skip this 'properties' node.
 				// https://github.com/pb33f/libopenapi/issues/160
@@ -211,8 +234,7 @@ func (index *SpecIndex) ExtractRefs(ctx context.Context, node, parent *yaml.Node
 			}
 
 			// Perform the same check for all arrays of schemas like allOf, anyOf, oneOf
-			arrayOfSchemaContainingNodes := []string{"allOf", "anyOf", "oneOf", "prefixItems"}
-			if i%2 == 0 && slices.Contains(arrayOfSchemaContainingNodes, n.Value) && !utils.IsNodeArray(node) && (i+1 < len(node.Content)) {
+			if i%2 == 0 && isArrayOfSchemaContainingNode(n.Value) && !utils.IsNodeArray(node) && (i+1 < len(node.Content)) {
 				// for each element in the array, add it to our schema definitions
 				for h, element := range node.Content[i+1].Content {
 
@@ -331,37 +353,27 @@ func (index *SpecIndex) ExtractRefs(ctx context.Context, node, parent *yaml.Node
 									fullDefinitionPath = value
 									componentName = fmt.Sprintf("#/%s", uri[1])
 								} else {
-									// if the index has a base path, use that to resolve the path
-									if index.config.BasePath != "" && index.config.BaseURL == nil {
-										abs, _ := filepath.Abs(utils.CheckPathOverlap(index.config.BasePath, uri[0], string(os.PathSeparator)))
-										if abs != defRoot {
-											abs, _ = filepath.Abs(utils.CheckPathOverlap(defRoot, uri[0], string(os.PathSeparator)))
+									// if the index has a base URL, use that to resolve the path.
+									if index.config.BaseURL != nil && !filepath.IsAbs(defRoot) {
+										var u url.URL
+										if strings.HasPrefix(defRoot, "http") {
+											up, _ := url.Parse(defRoot)
+											up.Path = utils.ReplaceWindowsDriveWithLinuxPath(filepath.Dir(up.Path))
+											u = *up
+										} else {
+											u = *index.config.BaseURL
 										}
+										// abs, _ := filepath.Abs(filepath.Join(u.Path, uri[0]))
+										// abs, _ := filepath.Abs(utils.CheckPathOverlap(u.Path, uri[0], string(os.PathSeparator)))
+										abs := utils.CheckPathOverlap(u.Path, uri[0], string(os.PathSeparator))
+										u.Path = utils.ReplaceWindowsDriveWithLinuxPath(abs)
+										fullDefinitionPath = fmt.Sprintf("%s#/%s", u.String(), uri[1])
+										componentName = fmt.Sprintf("#/%s", uri[1])
+
+									} else {
+										abs := index.resolveRelativeFilePath(defRoot, uri[0])
 										fullDefinitionPath = fmt.Sprintf("%s#/%s", abs, uri[1])
 										componentName = fmt.Sprintf("#/%s", uri[1])
-									} else {
-										// if the index has a base URL, use that to resolve the path.
-										if index.config.BaseURL != nil && !filepath.IsAbs(defRoot) {
-											var u url.URL
-											if strings.HasPrefix(defRoot, "http") {
-												up, _ := url.Parse(defRoot)
-												up.Path = utils.ReplaceWindowsDriveWithLinuxPath(filepath.Dir(up.Path))
-												u = *up
-											} else {
-												u = *index.config.BaseURL
-											}
-											// abs, _ := filepath.Abs(filepath.Join(u.Path, uri[0]))
-											// abs, _ := filepath.Abs(utils.CheckPathOverlap(u.Path, uri[0], string(os.PathSeparator)))
-											abs := utils.CheckPathOverlap(u.Path, uri[0], string(os.PathSeparator))
-											u.Path = utils.ReplaceWindowsDriveWithLinuxPath(abs)
-											fullDefinitionPath = fmt.Sprintf("%s#/%s", u.String(), uri[1])
-											componentName = fmt.Sprintf("#/%s", uri[1])
-
-										} else {
-											abs, _ := filepath.Abs(utils.CheckPathOverlap(defRoot, uri[0], string(os.PathSeparator)))
-											fullDefinitionPath = fmt.Sprintf("%s#/%s", abs, uri[1])
-											componentName = fmt.Sprintf("#/%s", uri[1])
-										}
 									}
 								}
 							}
@@ -384,29 +396,19 @@ func (index *SpecIndex) ExtractRefs(ctx context.Context, node, parent *yaml.Node
 									}
 								} else {
 									if !filepath.IsAbs(uri[0]) {
-										// if the index has a base path, use that to resolve the path
-										if index.config.BasePath != "" {
-											abs, _ := filepath.Abs(utils.CheckPathOverlap(index.config.BasePath, uri[0], string(os.PathSeparator)))
-											if abs != defRoot {
-												abs, _ = filepath.Abs(utils.CheckPathOverlap(defRoot, uri[0], string(os.PathSeparator)))
-											}
-											fullDefinitionPath = abs
+										// if the index has a base URL, use that to resolve the path.
+										if index.config.BaseURL != nil {
+
+											u := *index.config.BaseURL
+											abs := utils.CheckPathOverlap(u.Path, uri[0], string(os.PathSeparator))
+											abs = utils.ReplaceWindowsDriveWithLinuxPath(abs)
+											u.Path = abs
+											fullDefinitionPath = u.String()
 											componentName = uri[0]
 										} else {
-											// if the index has a base URL, use that to resolve the path.
-											if index.config.BaseURL != nil {
-
-												u := *index.config.BaseURL
-												abs := utils.CheckPathOverlap(u.Path, uri[0], string(os.PathSeparator))
-												abs = utils.ReplaceWindowsDriveWithLinuxPath(abs)
-												u.Path = abs
-												fullDefinitionPath = u.String()
-												componentName = uri[0]
-											} else {
-												abs, _ := filepath.Abs(utils.CheckPathOverlap(defRoot, uri[0], string(os.PathSeparator)))
-												fullDefinitionPath = abs
-												componentName = uri[0]
-											}
+											abs := index.resolveRelativeFilePath(defRoot, uri[0])
+											fullDefinitionPath = abs
+											componentName = uri[0]
 										}
 									}
 								}
@@ -630,9 +632,18 @@ func (index *SpecIndex) ExtractRefs(ctx context.Context, node, parent *yaml.Node
 					v = strings.Replace(v, "/", "~1", 1)
 				}
 
-				loc := append(seenPath, v)
-				definitionPath := "#/" + strings.Join(loc, "/")
-				_, jsonPath := utils.ConvertComponentIdIntoFriendlyPathSearch(definitionPath)
+				// Lazily compute jsonPath — only needed for description, summary, security, enum, properties.
+				var jsonPath string
+				var jsonPathComputed bool
+				computeJsonPath := func() string {
+					if !jsonPathComputed {
+						loc := append(seenPath, v)
+						definitionPath := "#/" + strings.Join(loc, "/")
+						_, jsonPath = utils.ConvertComponentIdIntoFriendlyPathSearch(definitionPath)
+						jsonPathComputed = true
+					}
+					return jsonPath
+				}
 
 				// capture descriptions and summaries
 				if n.Value == "description" {
@@ -654,7 +665,7 @@ func (index *SpecIndex) ExtractRefs(ctx context.Context, node, parent *yaml.Node
 						ref := &DescriptionReference{
 							ParentNode: parent,
 							Content:    node.Content[i+1].Value,
-							Path:       jsonPath,
+							Path:       computeJsonPath(),
 							Node:       node.Content[i+1],
 							KeyNode:    node.Content[i],
 							IsSummary:  false,
@@ -692,7 +703,7 @@ func (index *SpecIndex) ExtractRefs(ctx context.Context, node, parent *yaml.Node
 					ref := &DescriptionReference{
 						ParentNode: parent,
 						Content:    b.Value,
-						Path:       jsonPath,
+						Path:       computeJsonPath(),
 						Node:       b,
 						KeyNode:    n,
 						IsSummary:  true,
@@ -736,7 +747,7 @@ func (index *SpecIndex) ExtractRefs(ctx context.Context, node, parent *yaml.Node
 
 											refs = append(refs, &Reference{
 												Definition: b.Content[k].Content[g].Content[r].Value,
-												Path:       fmt.Sprintf("%s.security[%d].%s[%d]", jsonPath, k, secKey, r),
+												Path:       fmt.Sprintf("%s.security[%d].%s[%d]", computeJsonPath(), k, secKey, r),
 												Node:       b.Content[k].Content[g].Content[r],
 												KeyNode:    b.Content[k].Content[g],
 											})
@@ -767,7 +778,7 @@ func (index *SpecIndex) ExtractRefs(ctx context.Context, node, parent *yaml.Node
 					if enumKeyValueNode != nil {
 						ref := &EnumReference{
 							ParentNode: parent,
-							Path:       jsonPath,
+							Path:       computeJsonPath(),
 							Node:       node.Content[i+1],
 							KeyNode:    node.Content[i],
 							Type:       enumKeyValueNode,
@@ -797,7 +808,7 @@ func (index *SpecIndex) ExtractRefs(ctx context.Context, node, parent *yaml.Node
 
 						if isObject {
 							index.allObjectsWithProperties = append(index.allObjectsWithProperties, &ObjectReference{
-								Path:       jsonPath,
+								Path:       computeJsonPath(),
 								Node:       node,
 								KeyNode:    n,
 								ParentNode: parent,
@@ -833,6 +844,17 @@ func (index *SpecIndex) ExtractRefs(ctx context.Context, node, parent *yaml.Node
 // This function uses singleflight to deduplicate concurrent lookups for the same reference,
 // channel-based collection to avoid mutex contention during resolution, and sorts results
 // by input position for deterministic ordering.
+
+// isExternalReference checks whether a Reference originated from an external $ref.
+// ref.Definition may have been transformed (e.g., HTTP URL with fragment becomes "#/fragment"),
+// so we also check the original raw ref value.
+func isExternalReference(ref *Reference) bool {
+	if ref == nil {
+		return false
+	}
+	return utils.IsExternalRef(ref.Definition) || utils.IsExternalRef(ref.RawRef)
+}
+
 func (index *SpecIndex) ExtractComponentsFromRefs(ctx context.Context, refs []*Reference) []*Reference {
 	if len(refs) == 0 {
 		return nil
@@ -860,6 +882,10 @@ func (index *SpecIndex) ExtractComponentsFromRefs(ctx context.Context, refs []*R
 				}
 				index.refLock.Unlock()
 			} else {
+				// If SkipExternalRefResolution is enabled, don't record errors for external refs
+				if index.config != nil && index.config.SkipExternalRefResolution && isExternalReference(ref) {
+					continue
+				}
 				// Record error for definitive failure
 				_, path := utils.ConvertComponentIdIntoFriendlyPathSearch(ref.Definition)
 				index.errorLock.Lock()
@@ -979,6 +1005,10 @@ func (index *SpecIndex) ExtractComponentsFromRefs(ctx context.Context, refs []*R
 			}
 			index.refLock.Unlock()
 		} else {
+			// If SkipExternalRefResolution is enabled, don't record errors for external refs
+			if index.config != nil && index.config.SkipExternalRefResolution && isExternalReference(ref) {
+				continue
+			}
 			// Definitive failure - record error
 			_, path := utils.ConvertComponentIdIntoFriendlyPathSearch(ref.Definition)
 			index.errorLock.Lock()

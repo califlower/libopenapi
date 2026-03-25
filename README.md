@@ -14,20 +14,13 @@
 libopenapi has full support for OpenAPI 3, 3.1 and 3.2. It can handle the largest and most
 complex specifications you can think of.
 
+Overlays and Arazzo are also fully supported.
+
 ---
 
 ## Sponsors & users
 If your company is using `libopenapi`, please considering [supporting this project](https://github.com/sponsors/daveshanley), 
 like our _very kind_ sponsors:
-
-<a href="https://speakeasy.com/editor?utm_source=libopenapi+repo&utm_medium=github+sponsorship">
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/sponsors/speakeasy-github-sponsor-dark.svg">
-  <img alt="speakeasy'" src=".github/sponsors/speakeasy-github-sponsor-light.svg">
-</picture>
-</a>
-
-[Speakeasy](https://speakeasy.com/editor?utm_source=libopenapi+repo&utm_medium=github+sponsorship)
 
 <a href="https://scalar.com">
 <picture>
@@ -78,6 +71,7 @@ See all the documentation at https://pb33f.io/libopenapi/
 - [Bundling Specs](https://pb33f.io/libopenapi/bundling/)
 - [What Changed / Diff Engine](https://pb33f.io/libopenapi/what-changed/)
 - [Overlays](https://pb33f.io/libopenapi/overlays/)
+- [Arazzo](https://pb33f.io/libopenapi/arazzo/)
 - [FAQ](https://pb33f.io/libopenapi/faq/)
 - [About libopenapi](https://pb33f.io/libopenapi/about/)
 ---
